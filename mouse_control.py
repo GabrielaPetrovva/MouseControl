@@ -10,11 +10,10 @@ import time
 import random
 import shutil
 import requests
+from PIL import Image, ImageDraw, ImageFont
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
-
-from PIL import Image, ImageDraw, ImageFont
 
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python.vision import (
@@ -50,23 +49,97 @@ def get_font(size: int):
 def put_text_unicode(frame: np.ndarray, text: str, pos: Tuple[int,int],
                      font_size: int = 20, color: Tuple = (255,255,255),
                      bold: bool = False) -> None:
+    # Премахване на емоджита – задържаме само ASCII + латиница + кирилица
+    cleaned = ""
+    for ch in text:
+        cp = ord(ch)
+        # Emoji диапазони – пропускаме ги
+        if (0x1F300 <= cp <= 0x1FAFF) or (0x2600 <= cp <= 0x27BF) or (0xFE00 <= cp <= 0xFE0F):
+            continue
+        cleaned += ch
+    text = cleaned
+
     img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     draw    = ImageDraw.Draw(img_pil)
     font    = get_font(font_size)
-    draw.text((pos[0]+1, pos[1]+1), text, font=font, fill=(0,0,0,180))
+    draw.text((pos[0]+1, pos[1]+1), text, font=font, fill=(0, 0, 0, 180))
     draw.text(pos, text, font=font, fill=(color[2], color[1], color[0]))
     result  = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
     np.copyto(frame, result)
 
+
 # ──────────────────────────────────────────────
-# Вградени снимки – генерираме ги процедурно
-# (няма нужда от файлове на диска)
+# Помощна: зареждане на изображение с contain (без разтягане)
+# Поддържа PNG с алфа канал (за лого)
+# ──────────────────────────────────────────────
+
+def load_image_contain(path: str, target_w: int, target_h: int,
+                        bg_color: Tuple = (0, 0, 0)) -> np.ndarray:
+    """
+    Зарежда изображение и го поставя в target_w x target_h canvas
+    с contain логика (запазва aspect ratio, центрира, без разтягане).
+    PNG с прозрачност се компостира върху bg_color.
+    """
+    # Опит за зареждане с алфа
+    raw = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if raw is None:
+        # Fallback – черен canvas
+        canvas = np.full((target_h, target_w, 3), bg_color, dtype=np.uint8)
+        put_text_unicode(canvas, f"[ЛИПСВА: {os.path.basename(path)}]",
+                         (10, target_h // 2 - 10), font_size=14, color=(80, 80, 80))
+        return canvas
+
+    # Нормализация на каналите -> BGR + alpha маска
+    if raw.ndim == 2:
+        # Grayscale
+        bgr   = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
+        alpha = None
+    elif raw.shape[2] == 4:
+        bgr   = raw[:, :, :3]
+        alpha = raw[:, :, 3]
+    else:
+        bgr   = raw[:, :, :3]
+        alpha = None
+
+    src_h, src_w = bgr.shape[:2]
+
+    # Portrait / landscape адаптация – contain scaling
+    scale   = min(target_w / src_w, target_h / src_h)
+    new_w   = max(1, int(src_w * scale))
+    new_h   = max(1, int(src_h * scale))
+
+    bgr_r = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    if alpha is not None:
+        alpha_r = cv2.resize(alpha, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    # Canvas с фоново цвят
+    canvas = np.full((target_h, target_w, 3), bg_color, dtype=np.uint8)
+
+    # Центриране
+    off_x = (target_w - new_w) // 2
+    off_y = (target_h - new_h) // 2
+
+    if alpha is not None:
+        # Alpha compositing
+        a = alpha_r.astype(np.float32) / 255.0
+        for c in range(3):
+            canvas[off_y:off_y+new_h, off_x:off_x+new_w, c] = (
+                bgr_r[:, :, c].astype(np.float32) * a +
+                bg_color[c] * (1.0 - a)
+            ).astype(np.uint8)
+    else:
+        canvas[off_y:off_y+new_h, off_x:off_x+new_w] = bgr_r
+
+    return canvas
+
+
+# ──────────────────────────────────────────────
+# Процедурно генериране на изображения (fallback)
 # ──────────────────────────────────────────────
 
 def _make_gradient_image(w: int, h: int,
                           c1: Tuple, c2: Tuple, c3: Tuple,
                           style: str = "diagonal") -> np.ndarray:
-    """Генерира красиво градиентно изображение."""
     img = np.zeros((h, w, 3), dtype=np.float32)
     for y in range(h):
         for x in range(w):
@@ -91,102 +164,58 @@ def _make_gradient_image(w: int, h: int,
 
     return np.clip(img, 0, 255).astype(np.uint8)
 
-
-def _add_noise(img: np.ndarray, amount: float = 8.0) -> np.ndarray:
+def _add_noise(img, amount=8.0):
     noise = np.random.randn(*img.shape) * amount
     return np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
-
-def _add_circles(img: np.ndarray, color: Tuple, count: int = 12) -> np.ndarray:
-    h, w = img.shape[:2]
-    out  = img.copy()
+def _add_circles(img, color, count=12):
+    h, w = img.shape[:2]; out = img.copy()
     for _ in range(count):
-        cx  = random.randint(0, w)
-        cy  = random.randint(0, h)
-        r   = random.randint(20, min(w, h) // 3)
-        alpha = random.uniform(0.08, 0.22)
-        overlay = out.copy()
-        cv2.circle(overlay, (cx, cy), r, color, -1)
-        cv2.addWeighted(overlay, alpha, out, 1-alpha, 0, out)
+        cx = random.randint(0, w); cy = random.randint(0, h)
+        r  = random.randint(20, min(w, h) // 3)
+        al = random.uniform(0.08, 0.22)
+        ov = out.copy(); cv2.circle(ov, (cx, cy), r, color, -1)
+        cv2.addWeighted(ov, al, out, 1-al, 0, out)
     return out
 
-
-def _add_stars(img: np.ndarray, count: int = 60) -> np.ndarray:
-    h, w = img.shape[:2]
-    out  = img.copy()
+def _add_stars(img, count=60):
+    h, w = img.shape[:2]; out = img.copy()
     for _ in range(count):
-        x = random.randint(0, w-1)
-        y = random.randint(0, h-1)
-        r = random.randint(1, 3)
-        brightness = random.randint(180, 255)
-        cv2.circle(out, (x, y), r, (brightness, brightness, brightness), -1)
+        x = random.randint(0, w-1); y = random.randint(0, h-1)
+        r = random.randint(1, 3); br = random.randint(180, 255)
+        cv2.circle(out, (x, y), r, (br, br, br), -1)
     return out
 
-
-def _add_waves(img: np.ndarray, color: Tuple, count: int = 5) -> np.ndarray:
-    h, w = img.shape[:2]
-    out  = img.copy()
+def _add_waves(img, color, count=5):
+    h, w = img.shape[:2]; out = img.copy()
     for i in range(count):
-        pts = []
-        amp    = random.randint(15, 40)
-        freq   = random.uniform(0.01, 0.04)
-        offset = random.randint(50, h - 50)
+        pts = []; amp = random.randint(15, 40)
+        freq = random.uniform(0.01, 0.04); offset = random.randint(50, h-50)
         for x in range(0, w, 4):
-            y = int(offset + amp * math.sin(freq * x + i))
-            pts.append((x, max(0, min(h-1, y))))
+            y2 = int(offset + amp * math.sin(freq * x + i))
+            pts.append((x, max(0, min(h-1, y2))))
         for j in range(len(pts)-1):
-            alpha = random.uniform(0.1, 0.25)
-            overlay = out.copy()
-            cv2.line(overlay, pts[j], pts[j+1], color, 2)
-            cv2.addWeighted(overlay, alpha, out, 1-alpha, 0, out)
+            al = random.uniform(0.1, 0.25); ov = out.copy()
+            cv2.line(ov, pts[j], pts[j+1], color, 2)
+            cv2.addWeighted(ov, al, out, 1-al, 0, out)
     return out
 
-
-def _add_triangles(img: np.ndarray, color: Tuple, count: int = 8) -> np.ndarray:
-    h, w = img.shape[:2]
-    out  = img.copy()
+def _add_triangles(img, color, count=8):
+    h, w = img.shape[:2]; out = img.copy()
     for _ in range(count):
-        pts = np.array([
-            [random.randint(0, w), random.randint(0, h)],
-            [random.randint(0, w), random.randint(0, h)],
-            [random.randint(0, w), random.randint(0, h)],
-        ], np.int32)
-        alpha = random.uniform(0.06, 0.18)
-        overlay = out.copy()
-        cv2.fillPoly(overlay, [pts], color)
-        cv2.addWeighted(overlay, alpha, out, 1-alpha, 0, out)
+        pts = np.array([[random.randint(0,w), random.randint(0,h)],
+                        [random.randint(0,w), random.randint(0,h)],
+                        [random.randint(0,w), random.randint(0,h)]], np.int32)
+        al = random.uniform(0.06, 0.18); ov = out.copy()
+        cv2.fillPoly(ov, [pts], color)
+        cv2.addWeighted(ov, al, out, 1-al, 0, out)
     return out
 
-
-def _add_label(img: np.ndarray, text: str, emoji: str) -> np.ndarray:
-    """Добавя надпис с емоджи в центъра на изображението."""
-    h, w = img.shape[:2]
-    # Полупрозрачен правоъгълник
-    overlay = img.copy()
-    tw, th  = w // 3, h // 8
-    x1      = w // 2 - tw // 2
-    y1      = h // 2 - th // 2
-    cv2.rectangle(overlay, (x1, y1), (x1+tw, y1+th), (0,0,0), -1)
-    cv2.addWeighted(overlay, 0.45, img, 0.55, 0, img)
-
-    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    draw    = ImageDraw.Draw(img_pil)
-    font_big = get_font(32)
-    font_sm  = get_font(18)
-    # Емоджи горе
-    draw.text((w//2 - 20, y1 - 40), emoji, font=font_big, fill=(255,255,255))
-    # Текст
-    draw.text((x1 + 8, y1 + 6), text, font=font_sm, fill=(255,255,255))
-    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-
-
-# ── Дефиниции на темите ──────────────────────
 
 @dataclass
 class ImageTheme:
     key:   str
     label: str
-    emoji: str
     image: Optional[np.ndarray] = field(default=None, repr=False)
 
     def build(self, w: int, h: int) -> None:
@@ -194,104 +223,27 @@ class ImageTheme:
 
 
 def _generate_theme_image(key: str, w: int, h: int) -> np.ndarray:
-    random.seed(hash(key) % 9999)  # Винаги еднакво за една тема
+    img_path = f"puzzle_images/{key}.jpg"
+    png_path  = f"puzzle_images/{key}.png"
 
-    if key == "ocean":
-        img = Image.open("puzzle_images/ocean.jpg").convert("RGB")
-        img = img.resize((w, h))
+    for path in [img_path, png_path]:
+        if os.path.exists(path):
+            return load_image_contain(path, w, h, bg_color=(10, 10, 10))
 
-        # PIL -> numpy (ВАЖНО)
-        img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-        img = _add_noise(img, 6)
-        img = _add_waves(img, (100, 210, 230), count=8)
-        img = _add_circles(img, (50, 180, 220), count=5)
-
-    elif key == "sunset":
-        img = cv2.imread("puzzle_images/sunset.jpg")
-        img = cv2.resize(img, (w, h))
-        img = _add_noise(img, 5)
-        cv2.circle(img, (int(w * 0.65), int(h * 0.35)), 55, (0, 200, 255), -1)
-        cv2.circle(img, (int(w * 0.65), int(h * 0.35)), 60, (0, 170, 230), 4)
-        img = _add_triangles(img, (0, 80, 200), count=10)
-
-    elif key == "forest":
-        img = cv2.imread("puzzle_images/forest.jpg")
-        img = cv2.resize(img, (w, h))
-
-        img = _add_noise(img, 8)
-        img = _add_circles(img, (60, 180, 40), count=15)
-        img = _add_triangles(img, (20, 100, 20), count=12)
-
-    elif key == "space":
-        img = cv2.imread("puzzle_images/space.jpg")
-        img = cv2.resize(img, (w, h))
-
-        img = _add_noise(img, 4)
-        img = _add_stars(img, count=120)
-
-        cx, cy = int(w*0.7), int(h*0.35)
-        cv2.circle(img, (cx, cy), 70, (60, 30, 120), -1)
-        cv2.circle(img, (cx, cy), 70, (100, 60, 180), 4)
-        cv2.ellipse(img, (cx, cy), (110, 30), -20, 0, 360, (80, 50, 140), 3)
-
-    elif key == "candy":
-        img = cv2.imread("puzzle_images/candy.jpg")
-        img = cv2.resize(img, (w, h))
-
-        img = _add_noise(img, 7)
-        img = _add_circles(img, (255, 200, 60), count=12)
-        img = _add_triangles(img, (200, 80, 240), count=8)
-
-        for _ in range(25):
-            cx_ = random.randint(0, w)
-            cy_ = random.randint(0, h)
-            r_  = random.randint(5, 18)
-            col = (random.randint(200,255), random.randint(100,200), random.randint(150,255))
-            cv2.circle(img, (cx_, cy_), r_, col, -1)
-
-    elif key == "mountain":
-        img = cv2.imread("puzzle_images/mountain.jpg")
-        img = cv2.resize(img, (w, h))
-
-        img = _add_noise(img, 6)
-
-    elif key == "abstract":
-        img = cv2.imread("puzzle_images/abstract.jpg")
-        img = cv2.resize(img, (w, h))
-
-        img = _add_noise(img, 10)
-        img = _add_triangles(img, (200, 80, 240), count=20)
-        img = _add_circles(img, (255, 120, 60), count=10)
-
-    elif key == "beach":
-        img = cv2.imread("puzzle_images/beach.jpg")
-        img = cv2.resize(img, (w, h))
-
-        img = _add_noise(img, 5)
-        img = _add_waves(img, (80, 200, 220), count=4)
-        cv2.circle(img, (int(w*0.75), int(h*0.2)), 45, (0, 210, 255), -1)
-
-    else:
-        img = _make_gradient_image(
-            w, h,
-            (80, 80, 80), (160, 160, 180), (40, 40, 60),
-            style="diagonal"
-        )
-        img = _add_noise(img, 5)
-
-    return img
+    # Fallback – тъмен градиент ако файлът липсва
+    return _make_gradient_image(w, h, (80,80,80), (160,160,180), (40,40,60))
 
 
 IMAGE_THEMES: List[ImageTheme] = [
-    ImageTheme("ocean",    "Океан",    "🌊"),
-    ImageTheme("sunset",   "Залез",    "🌅"),
-    ImageTheme("forest",   "Гора",     "🌲"),
-    ImageTheme("space",    "Космос",   "🌌"),
-    ImageTheme("candy",    "Бонбони",  "🍭"),
-    ImageTheme("mountain", "Планини",  "⛰"),
-    ImageTheme("abstract", "Абстракт", "🎨"),
-    ImageTheme("beach",    "Плаж",     "🏖"),
+    ImageTheme("ocean",    "Океан"),
+    ImageTheme("sunset",   "Залез"),
+    ImageTheme("forest",   "Гора"),
+    ImageTheme("space",    "Космос"),
+    ImageTheme("candy",    "Бонбони"),
+    ImageTheme("mountain", "Планини"),
+    ImageTheme("abstract", "Абстракт"),
+    ImageTheme("beach",    "Плаж"),
+    ImageTheme("logo",     "Лого"),
 ]
 
 # ──────────────────────────────────────────────
@@ -312,8 +264,8 @@ MODEL_URL  = (
 @dataclass
 class Config:
     camera_index:   int   = 0
-    cam_width:      int   = 640
-    cam_height:     int   = 480
+    cam_width:      int   = 1280
+    cam_height:     int   = 720
     fps_limit:      int   = 30
     smooth_window:  int   = 6
     active_zone_x:  Tuple = (0.1, 0.9)
@@ -364,14 +316,11 @@ def lm_xy(landmarks, idx: int) -> Tuple[float, float]:
     lm = landmarks[idx]
     return lm.x, lm.y
 
-
 def dist(p1, p2) -> float:
     return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
 
-
 def finger_up(landmarks, tip: int, pip: int) -> bool:
     return landmarks[tip].y < landmarks[pip].y
-
 
 def map_to_screen(nx: float, ny: float) -> Tuple[int, int]:
     ax0, ax1 = CFG.active_zone_x
@@ -381,7 +330,6 @@ def map_to_screen(nx: float, ny: float) -> Tuple[int, int]:
     sx = int(np.interp(nx, [ax0, ax1], [0, SCREEN_W]))
     sy = int(np.interp(ny, [ay0, ay1], [0, SCREEN_H]))
     return sx, sy
-
 
 def draw_rounded_rect(frame, x1, y1, x2, y2, color, radius=10, thickness=-1):
     if thickness == -1:
@@ -424,7 +372,7 @@ def detect_gesture(landmarks) -> str:
     return "none"
 
 # ──────────────────────────────────────────────
-# Туториал режим
+# Туториал режим (без емоджита в иконите)
 # ──────────────────────────────────────────────
 
 @dataclass
@@ -443,13 +391,16 @@ TUTORIAL_WARN = (0, 120, 255)
 def _icon_move(frame, cx, cy):
     cv2.arrowedLine(frame, (cx, cy+30), (cx+40, cy-20), (0,220,120), 3, tipLength=0.35)
     cv2.circle(frame, (cx, cy+30), 8, (255,255,255), -1)
-    put_text_unicode(frame, "☝", (cx-12, cy-55), font_size=32, color=(255,220,80))
+    # Замест емоджи – малък правоъгълник символизиращ пръст
+    cv2.rectangle(frame, (cx-6, cy-50), (cx+6, cy-20), (255,220,80), -1)
 
 def _icon_pinch(frame, cx, cy):
-    cv2.circle(frame, (cx-15, cy),    9, (255,255,255), -1)
-    cv2.circle(frame, (cx+15, cy),    9, (255,255,255), -1)
-    cv2.line(frame,   (cx-6, cy), (cx+6, cy), (0,180,255), 2)
-    put_text_unicode(frame, "🤏", (cx-18, cy-55), font_size=30, color=(0,180,255))
+    cv2.circle(frame, (cx-15, cy), 9, (255,255,255), -1)
+    cv2.circle(frame, (cx+15, cy), 9, (255,255,255), -1)
+    cv2.line(frame,   (cx-6,  cy), (cx+6, cy), (0,180,255), 2)
+    # Символ на щипка – две линии, сближаващи се
+    cv2.line(frame, (cx-20, cy-30), (cx, cy-10), (0,180,255), 3)
+    cv2.line(frame, (cx+20, cy-30), (cx, cy-10), (0,180,255), 3)
 
 def _icon_two_fingers(frame, cx, cy):
     cv2.line(frame, (cx-12, cy+20), (cx-12, cy-25), (255,255,255), 5)
@@ -471,6 +422,7 @@ def _icon_puzzle(frame, cx, cy):
     ], np.int32)
     cv2.fillPoly(frame, [pts], (80, 140, 220))
     cv2.polylines(frame, [pts], True, (255,255,255), 2)
+
 
 TUTORIAL_STEPS: List[TutorialStep] = [
     TutorialStep(
@@ -535,26 +487,35 @@ class TutorialMode:
 
     def draw(self, frame: np.ndarray, gesture: str, landmarks) -> None:
         h, w = frame.shape[:2]
-        alpha = 0.72
-        overlay = frame.copy()
-        panel_w, panel_h = 300, 240
-        px, py = 8, h - panel_h - 8
+        # Скалиране на панела спрямо размера на прозореца
+        scale    = min(w / 640, h / 480)
+        panel_w  = int(300 * scale)
+        panel_h  = int(240 * scale)
+        alpha    = 0.72
+        overlay  = frame.copy()
+        px, py   = 8, h - panel_h - 8
         draw_rounded_rect(overlay, px, py, px+panel_w, py+panel_h, TUTORIAL_BG, radius=14)
         cv2.addWeighted(overlay, alpha, frame, 1-alpha, 0, frame)
 
+        fs_sm = max(11, int(13 * scale))
+        fs_md = max(12, int(15 * scale))
+        fs_lg = max(14, int(18 * scale))
+
         if self.all_done:
-            put_text_unicode(frame, "Туториалът е завършен!", (px+14, py+90),
-                             font_size=18, color=(0,255,120))
-            put_text_unicode(frame, "Натиснете T за изход", (px+14, py+122),
-                             font_size=15, color=(180,180,180))
+            put_text_unicode(frame, "Туториалът е завършен!", (px+14, py+int(90*scale)),
+                             font_size=fs_md, color=(0,255,120))
+            put_text_unicode(frame, "Натиснете T за изход", (px+14, py+int(122*scale)),
+                             font_size=fs_sm, color=(180,180,180))
             return
 
         step = self.current
-        put_text_unicode(frame, step.title, (px+12, py+10), font_size=15, color=(0,200,255))
+        put_text_unicode(frame, step.title, (px+12, py+10), font_size=fs_md, color=(0,200,255))
         for i, line in enumerate(step.description.split("\n")):
-            put_text_unicode(frame, line, (px+12, py+34+i*20), font_size=13, color=(210,210,210))
+            put_text_unicode(frame, line, (px+12, py+34+i*int(20*scale)),
+                             font_size=fs_sm, color=(210,210,210))
 
-        bar_x, bar_y = px+12, py+panel_h-46
+        bar_x = px + 12
+        bar_y = py + panel_h - int(46 * scale)
         bar_w = panel_w - 24
         cv2.rectangle(frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+12), (40,40,60), -1)
         fill = int(bar_w * self.progress_ratio(gesture))
@@ -568,58 +529,65 @@ class TutorialMode:
         else:
             status = "Покажете жеста ->"
             color  = (180, 180, 0)
-        put_text_unicode(frame, status, (px+12, py+panel_h-26), font_size=13, color=color)
+        put_text_unicode(frame, status, (px+12, py+panel_h-int(26*scale)),
+                         font_size=fs_sm, color=color)
 
         total = len(TUTORIAL_STEPS)
         for i in range(total):
-            cx = px + 12 + i * 26
-            cy = py + panel_h - 60
+            cx2 = px + 12 + i * int(26 * scale)
+            cy2 = py + panel_h - int(60 * scale)
             col = TUTORIAL_OK if i < self.step_idx else \
                   TUTORIAL_ACNT if i == self.step_idx else (60,60,80)
-            cv2.circle(frame, (cx, cy), 7, col, -1)
+            cv2.circle(frame, (cx2, cy2), int(7*scale), col, -1)
 
-        step.icon_func(frame, px + panel_w - 50, py + 85)
+        step.icon_func(frame, px + panel_w - int(50*scale), py + int(85*scale))
 
 
 # ──────────────────────────────────────────────
-# Избор на тема – красив менюселектор
+# Избор на тема
 # ──────────────────────────────────────────────
 
 class ThemeSelector:
-    """Показва миниатюри на темите и позволява избор с N/B."""
-
-    THUMB_W = 100
-    THUMB_H =  70
-    COLS    =   4
-    PAD     =   8
+    COLS = 4
+    PAD  = 8
 
     def __init__(self, frame_w: int, frame_h: int):
         self.fw = frame_w
         self.fh = frame_h
+        # Размер на миниатюрите – скалира се спрямо прозореца
+        self.THUMB_W = max(80, frame_w // 10)
+        self.THUMB_H = max(56, frame_h // 9)
         self.thumbs: List[np.ndarray] = []
         self._build_thumbs(frame_w, frame_h)
 
     def _build_thumbs(self, fw: int, fh: int):
-        # Генерираме пъзел изображения (по-малък размер за миниатюри)
         bw = fw // 2
         bh = fh
         self.thumbs = []
         for theme in IMAGE_THEMES:
             if theme.image is None:
                 theme.build(bw, bh)
-            thumb = cv2.resize(theme.image, (self.THUMB_W, self.THUMB_H))
+            # Миниатюра с contain логика
+            thumb = np.full((self.THUMB_H, self.THUMB_W, 3), (20, 20, 40), dtype=np.uint8)
+            src   = theme.image
+            sh, sw = src.shape[:2]
+            sc     = min(self.THUMB_W / sw, self.THUMB_H / sh)
+            nw, nh = max(1, int(sw*sc)), max(1, int(sh*sc))
+            resized = cv2.resize(src, (nw, nh), interpolation=cv2.INTER_AREA)
+            ox = (self.THUMB_W - nw) // 2
+            oy = (self.THUMB_H - nh) // 2
+            thumb[oy:oy+nh, ox:ox+nw] = resized
             self.thumbs.append(thumb)
 
     def draw(self, frame: np.ndarray, current_idx: int) -> None:
         h, w = frame.shape[:2]
-        rows = math.ceil(len(IMAGE_THEMES) / self.COLS)
+        rows  = math.ceil(len(IMAGE_THEMES) / self.COLS)
         total_w = self.COLS * (self.THUMB_W + self.PAD) + self.PAD
-        total_h = rows * (self.THUMB_H + self.PAD) + self.PAD + 40
+        total_h = rows * (self.THUMB_H + self.PAD + 18) + self.PAD + 44
 
         start_x = w // 2 - total_w // 2
         start_y = h // 2 - total_h // 2
 
-        # Фон
         overlay = frame.copy()
         draw_rounded_rect(overlay, start_x - 10, start_y - 10,
                           start_x + total_w + 10, start_y + total_h + 10,
@@ -633,27 +601,23 @@ class ThemeSelector:
             row = i // self.COLS
             col = i % self.COLS
             x   = start_x + self.PAD + col * (self.THUMB_W + self.PAD)
-            y   = start_y + 36 + row * (self.THUMB_H + self.PAD)
+            y   = start_y + 44 + row * (self.THUMB_H + self.PAD + 18)
 
-            # Миниатюра
             frame[y:y+self.THUMB_H, x:x+self.THUMB_W] = self.thumbs[i]
 
-            # Рамка (по-дебела за избраната)
             if i == current_idx:
                 cv2.rectangle(frame, (x-3, y-3),
                               (x+self.THUMB_W+3, y+self.THUMB_H+3),
                               (0, 220, 255), 3)
-                # Стрелка горе
-                put_text_unicode(frame, "▼", (x + self.THUMB_W//2 - 6, y - 20),
-                                 font_size=14, color=(0, 220, 255))
+                put_text_unicode(frame, "v", (x + self.THUMB_W//2 - 4, y - 18),
+                                 font_size=13, color=(0, 220, 255))
             else:
                 cv2.rectangle(frame, (x, y), (x+self.THUMB_W, y+self.THUMB_H),
                               (80, 80, 100), 1)
 
-            # Надпис
-            put_text_unicode(frame, theme.emoji + " " + theme.label,
+            put_text_unicode(frame, theme.label,
                              (x + 2, y + self.THUMB_H + 2),
-                             font_size=11, color=(200,200,220))
+                             font_size=11, color=(200, 200, 220))
 
 
 # ──────────────────────────────────────────────
@@ -710,9 +674,12 @@ class PuzzleGame:
 
     def _get_source(self) -> np.ndarray:
         theme = IMAGE_THEMES[self.theme_idx % len(IMAGE_THEMES)]
-        if theme.image is None:
+        # Винаги генерираме на точния размер на пъзел зоната
+        if theme.image is None or \
+           theme.image.shape[1] != self.board_w or \
+           theme.image.shape[0] != self.board_h:
             theme.build(self.board_w, self.board_h)
-        return cv2.resize(theme.image, (self.board_w, self.board_h))
+        return theme.image
 
     def _build_puzzle(self):
         bw, bh = self.board_w, self.board_h
@@ -727,14 +694,12 @@ class PuzzleGame:
                 ty = self.board_y + r * ph
                 piece_img = source[r*ph:(r+1)*ph, c*pw:(c+1)*pw].copy()
 
-                # Решетка
                 cv2.rectangle(piece_img, (0,0), (pw-1, ph-1), (255,255,255), 2)
 
-                # Номер
                 num = r * self.COLS + c + 1
                 img_pil = Image.fromarray(cv2.cvtColor(piece_img, cv2.COLOR_BGR2RGB))
                 draw    = ImageDraw.Draw(img_pil)
-                font    = get_font(20)
+                font    = get_font(max(14, pw // 6))
                 draw.text((pw//2 - 7, ph//2 - 14), str(num), font=font, fill=(0,0,0,160))
                 draw.text((pw//2 - 8, ph//2 - 15), str(num), font=font, fill=(255,255,255,220))
                 piece_img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
@@ -830,6 +795,7 @@ class PuzzleGame:
         h, w = frame.shape[:2]
         now  = time.time()
         theme = IMAGE_THEMES[self.theme_idx % len(IMAGE_THEMES)]
+        scale = min(w / 640, h / 480)
 
         # Фон на пъзел зоната
         grad = np.zeros((h, self.board_w, 3), dtype=np.uint8)
@@ -896,21 +862,25 @@ class PuzzleGame:
         # Разделителна линия
         cv2.line(frame, (self.board_x, 0), (self.board_x, h), (60, 100, 140), 2)
 
-        # Прогрес панел
+        # Прогрес панел – скалиран
         placed  = sum(1 for p in self.pieces if p.placed)
         total   = len(self.pieces)
         elapsed = int(now - self.start_time)
         panel_x = self.board_x + 4
+        panel_w2 = min(240, self.board_w - 8)
 
-        draw_rounded_rect(frame, panel_x, 4, panel_x + 210, 72, (20, 20, 35), radius=8)
+        fs_sm = max(10, int(12 * scale))
+        fs_md = max(12, int(14 * scale))
+
+        draw_rounded_rect(frame, panel_x, 4, panel_x + panel_w2, 76, (20, 20, 35), radius=8)
         put_text_unicode(frame,
-            f"{theme.emoji} {theme.label}: {placed}/{total}",
-            (panel_x + 8, 8), font_size=14, color=(0, 200, 255))
+            f"{theme.label}: {placed}/{total}",
+            (panel_x + 8, 8), font_size=fs_md, color=(0, 200, 255))
         put_text_unicode(frame, f"Време: {elapsed} сек",
-            (panel_x + 8, 30), font_size=13, color=(160, 200, 160))
+            (panel_x + 8, 30), font_size=fs_sm, color=(160, 200, 160))
 
-        bar_x, bar_y = panel_x + 8, 54
-        bar_w = 194
+        bar_x, bar_y = panel_x + 8, 56
+        bar_w = panel_w2 - 16
         cv2.rectangle(frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+10), (40,40,60), -1)
         fill_w = int(bar_w * placed / total) if total > 0 else 0
         if fill_w > 0:
@@ -918,26 +888,27 @@ class PuzzleGame:
         cv2.rectangle(frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+10), (80,80,100), 1)
 
         # Инструкции
-        hints_y = h - 76
-        draw_rounded_rect(frame, panel_x, hints_y, panel_x + 210, h - 4, (20,20,35), radius=8)
-        put_text_unicode(frame, "N = следваща тема",   (panel_x+8, hints_y+6),  font_size=12, color=(140,140,160))
-        put_text_unicode(frame, "B = предишна тема",   (panel_x+8, hints_y+22), font_size=12, color=(140,140,160))
-        put_text_unicode(frame, "R = разбъркай",       (panel_x+8, hints_y+38), font_size=12, color=(140,140,160))
-        put_text_unicode(frame, "M = меню с теми",     (panel_x+8, hints_y+54), font_size=12, color=(140,140,160))
+        hints_y = h - 88
+        draw_rounded_rect(frame, panel_x, hints_y, panel_x + panel_w2, h - 4, (20,20,35), radius=8)
+        put_text_unicode(frame, "N = следваща тема",   (panel_x+8, hints_y+6),  font_size=fs_sm, color=(140,140,160))
+        put_text_unicode(frame, "B = предишна тема",   (panel_x+8, hints_y+22), font_size=fs_sm, color=(140,140,160))
+        put_text_unicode(frame, "R = разбъркай",       (panel_x+8, hints_y+38), font_size=fs_sm, color=(140,140,160))
+        put_text_unicode(frame, "M = меню с теми",     (panel_x+8, hints_y+54), font_size=fs_sm, color=(140,140,160))
+        put_text_unicode(frame, "P = изход от пъзел",  (panel_x+8, hints_y+70), font_size=fs_sm, color=(140,140,160))
 
         # Курсор
         if cursor_xy:
-            cx, cy = cursor_xy
+            cx2, cy2 = cursor_xy
             pulse_c = int(200 + 55 * math.sin(now * 6))
             color   = (0, pulse_c, 255) if is_grabbing else (255, 255, 255)
-            cv2.circle(frame, (cx, cy), 14, color, 2)
-            cv2.circle(frame, (cx, cy),  3, color, -1)
-            cv2.line(frame, (cx-20, cy), (cx-8, cy),  color, 1)
-            cv2.line(frame, (cx+8,  cy), (cx+20, cy), color, 1)
-            cv2.line(frame, (cx, cy-20), (cx, cy-8),  color, 1)
-            cv2.line(frame, (cx, cy+8),  (cx, cy+20), color, 1)
+            cv2.circle(frame, (cx2, cy2), 14, color, 2)
+            cv2.circle(frame, (cx2, cy2),  3, color, -1)
+            cv2.line(frame, (cx2-20, cy2), (cx2-8,  cy2), color, 1)
+            cv2.line(frame, (cx2+8,  cy2), (cx2+20, cy2), color, 1)
+            cv2.line(frame, (cx2, cy2-20), (cx2, cy2-8),  color, 1)
+            cv2.line(frame, (cx2, cy2+8),  (cx2, cy2+20), color, 1)
             if is_grabbing:
-                put_text_unicode(frame, "ХВАНАТО", (cx+18, cy-12),
+                put_text_unicode(frame, "ХВАНАТО", (cx2+18, cy2-12),
                                  font_size=13, color=(0, 220, 255))
 
         # Победа
@@ -947,6 +918,7 @@ class PuzzleGame:
     def _draw_win_banner(self, frame: np.ndarray, duration: int):
         h, w = frame.shape[:2]
         theme = IMAGE_THEMES[self.theme_idx % len(IMAGE_THEMES)]
+        scale = min(w / 640, h / 480)
         overlay = frame.copy()
         bx1, by1 = w//4 - 20, h//3 - 10
         bx2, by2 = 3*w//4 + 20, 2*h//3 + 20
@@ -954,13 +926,32 @@ class PuzzleGame:
         cv2.addWeighted(overlay, 0.88, frame, 0.12, 0, frame)
         draw_rounded_rect(frame, bx1, by1, bx2, by2, (0, 200, 80), radius=16, thickness=3)
         put_text_unicode(frame, "БРАВО!",
-            (bx1 + 60, by1 + 20), font_size=28, color=(0, 255, 120))
+            (bx1 + int(60*scale), by1 + 20), font_size=int(28*scale), color=(0, 255, 120))
         put_text_unicode(frame, f"Завършен за {duration} секунди",
-            (bx1 + 30, by1 + 70), font_size=18, color=(200, 240, 200))
-        put_text_unicode(frame, f"Тема: {theme.emoji} {theme.label}",
-            (bx1 + 50, by1 + 100), font_size=15, color=(160, 200, 160))
+            (bx1 + int(30*scale), by1 + int(70*scale)), font_size=int(18*scale), color=(200, 240, 200))
+        put_text_unicode(frame, f"Тема: {theme.label}",
+            (bx1 + int(50*scale), by1 + int(100*scale)), font_size=int(15*scale), color=(160, 200, 160))
         put_text_unicode(frame, "N = нова тема  |  R = пак",
-            (bx1 + 40, by1 + 130), font_size=14, color=(120, 160, 120))
+            (bx1 + int(40*scale), by1 + int(130*scale)), font_size=int(14*scale), color=(120, 160, 120))
+
+
+# ──────────────────────────────────────────────
+# Помощна: contain от numpy array
+# ──────────────────────────────────────────────
+
+def load_image_contain_from_array(src: np.ndarray, target_w: int, target_h: int,
+                                   bg_color: Tuple = (15, 15, 25)) -> np.ndarray:
+    """Поставя съществуващ BGR image в canvas с contain логика."""
+    sh, sw = src.shape[:2]
+    scale  = min(target_w / sw, target_h / sh)
+    nw = max(1, int(sw * scale))
+    nh = max(1, int(sh * scale))
+    resized = cv2.resize(src, (nw, nh), interpolation=cv2.INTER_AREA)
+    canvas  = np.full((target_h, target_w, 3), bg_color, dtype=np.uint8)
+    ox = (target_w - nw) // 2
+    oy = (target_h - nh) // 2
+    canvas[oy:oy+nh, ox:ox+nw] = resized
+    return canvas
 
 
 # ──────────────────────────────────────────────
@@ -972,7 +963,7 @@ GESTURE_LABEL = {
     "click":       "Пинч клик",
     "right_click": "Десен клик",
     "scroll":      "Скрол",
-    "none":        "—",
+    "none":        "-",
 }
 GESTURE_COLOR = {
     "move":        (0,255,80),
@@ -996,6 +987,9 @@ def draw_hand(frame: np.ndarray, landmarks, w: int, h: int) -> None:
 def draw_overlay(frame: np.ndarray, gesture: str, fps: float,
                  puzzle_mode: bool, tutorial_mode: bool) -> None:
     h, w = frame.shape[:2]
+    scale = min(w / 640, h / 480)
+    fs_sm = max(10, int(12 * scale))
+    fs_md = max(12, int(15 * scale))
 
     if not puzzle_mode and not tutorial_mode:
         ax0 = int(CFG.active_zone_x[0] * w)
@@ -1004,7 +998,8 @@ def draw_overlay(frame: np.ndarray, gesture: str, fps: float,
         ay1 = int(CFG.active_zone_y[1] * h)
         cv2.rectangle(frame, (ax0, ay0), (ax1, ay1), (0, 200, 80), 1)
 
-    draw_rounded_rect(frame, 6, 4, 246, 70, (15, 15, 35), radius=8)
+    panel_w = min(320, w - 12)
+    draw_rounded_rect(frame, 6, 4, 6 + panel_w, 74, (15, 15, 35), radius=8)
     color = GESTURE_COLOR.get(gesture, (160,160,160))
 
     mode_str = ""
@@ -1012,9 +1007,9 @@ def draw_overlay(frame: np.ndarray, gesture: str, fps: float,
     if tutorial_mode: mode_str = "[УРОК] "
 
     put_text_unicode(frame, f"{mode_str}Жест: {GESTURE_LABEL.get(gesture,'?')}",
-                     (12, 8), font_size=15, color=color)
+                     (12, 8), font_size=fs_md, color=color)
     put_text_unicode(frame, f"FPS: {fps:.1f}  |  T=Урок  P=Пъзел  Q=Изход",
-                     (12, 32), font_size=12, color=(160, 160, 160))
+                     (12, 32), font_size=fs_sm, color=(160, 160, 160))
 
     if not puzzle_mode and not tutorial_mode:
         hints = [
@@ -1025,27 +1020,31 @@ def draw_overlay(frame: np.ndarray, gesture: str, fps: float,
             ("T",          "Урок режим"),
             ("P",          "Пъзел режим"),
         ]
-        panel_x = w - 220
+        panel_x = w - min(230, w // 3)
         draw_rounded_rect(frame, panel_x-4, 4, w-4, 4+len(hints)*22+8, (15,15,35), radius=8)
         for i, (g, a) in enumerate(hints):
             put_text_unicode(frame, f"{g}: {a}", (panel_x, 10+i*22),
-                             font_size=12, color=(150,180,150))
+                             font_size=fs_sm, color=(150,180,150))
 
 
 # ──────────────────────────────────────────────
 # Главен контролер
 # ──────────────────────────────────────────────
 
+# Глобален прозорец – пълен екран
+WINDOW_NAME = "Camera Mouse Control"
+
+def setup_fullscreen_window():
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+
 class CameraMouseController:
     def __init__(self):
         download_model()
         ensure_font()
 
-        # Предгенерираме всички теми (малки изображения) за по-бърз старт
-        print("Генерирам теми за пъзела...", end=" ", flush=True)
-        for theme in IMAGE_THEMES:
-            theme.build(320, 240)   # ще се регенерират при реален размер при нужда
-        print("OK")
+        # Темите се генерират при нужда на правилния размер (не предварително на малък)
 
         self.pos_buffer      = deque(maxlen=CFG.smooth_window)
         self.last_click      = 0.0
@@ -1069,6 +1068,8 @@ class CameraMouseController:
         self.pinch_stable  = False
         self.pinch_prev    = False
         self.puzzle_cursor_buf = deque(maxlen=8)
+
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
 
         def _callback(result: HandLandmarkerResult, _, timestamp_ms: int):
             self.latest_result = result
@@ -1107,9 +1108,9 @@ class CameraMouseController:
             self.scroll_ref_y = ny
             self.scroll_accum = 0.0
             return
-        delta_norm     = self.scroll_ref_y - ny
+        delta_norm = self.scroll_ref_y - ny
         self.scroll_accum += delta_norm * SCREEN_H
-        scroll_units   = int(self.scroll_accum / CFG.scroll_sens)
+        scroll_units = int(self.scroll_accum / CFG.scroll_sens)
         if scroll_units != 0:
             pyautogui.scroll(scroll_units)
             self.scroll_accum -= scroll_units * CFG.scroll_sens
@@ -1172,13 +1173,12 @@ class CameraMouseController:
             self._fps_timer   = time.time()
 
     def _switch_theme(self, delta: int):
-        """Сменя темата с delta стъпки (+1 или -1)."""
         self.current_theme_idx = (self.current_theme_idx + delta) % len(IMAGE_THEMES)
         if self.puzzle:
             self.puzzle.reset(theme_idx=self.current_theme_idx)
             self._reset_pinch()
         theme = IMAGE_THEMES[self.current_theme_idx]
-        print(f"[Тема] {theme.emoji} {theme.label}")
+        print(f"[Тема] {theme.label}")
 
     def run(self) -> None:
         cap = cv2.VideoCapture(CFG.camera_index)
@@ -1204,8 +1204,9 @@ class CameraMouseController:
                 print("[ГРЕШКА] Не може да се прочете кадър.")
                 break
 
-            frame   = cv2.flip(frame, 1)
-            h, w    = frame.shape[:2]
+            frame = cv2.flip(frame, 1)
+            h, w  = frame.shape[:2]
+
             gesture = "none"
             cursor  = None
             grabbing= False
@@ -1259,12 +1260,11 @@ class CameraMouseController:
                 self.tutorial.draw(frame, gesture,
                     result.hand_landmarks[0] if (result and result.hand_landmarks) else None)
 
-            # Меню за теми (наслагване върху всичко останало)
             if self.show_theme_menu and self.selector:
                 self.selector.draw(frame, self.current_theme_idx)
 
             self.update_fps()
-            cv2.imshow("Camera Mouse Control", frame)
+            cv2.imshow(WINDOW_NAME, frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
@@ -1291,7 +1291,7 @@ class CameraMouseController:
                     elif self.puzzle.completed:
                         self.puzzle.reset(theme_idx=self.current_theme_idx)
                     theme = IMAGE_THEMES[self.current_theme_idx]
-                    print(f"[Режим] Пъзел – {theme.emoji} {theme.label}")
+                    print(f"[Режим] Пъзел - {theme.label}")
                 else:
                     print("[Режим] Нормален")
 
@@ -1304,7 +1304,8 @@ class CameraMouseController:
             elif key == ord("m") and self.puzzle_mode:
                 self.show_theme_menu = not self.show_theme_menu
                 if self.show_theme_menu:
-                    if self.selector is None:
+                    if self.selector is None or \
+                       self.selector.fw != w or self.selector.fh != h:
                         self.selector = ThemeSelector(w, h)
                     print("[Меню] Избор на тема")
                 else:
@@ -1316,12 +1317,20 @@ class CameraMouseController:
                     self.puzzle.reset(theme_idx=self.current_theme_idx)
                     self._reset_pinch()
                 theme = IMAGE_THEMES[self.current_theme_idx]
-                print(f"[Тема] Избрана: {theme.emoji} {theme.label}")
+                print(f"[Тема] Избрана: {theme.label}")
 
             elif key == ord("r") and self.puzzle_mode and self.puzzle:
                 self.puzzle.reset()
                 self._reset_pinch()
                 print("[Пъзел] Разбъркан отново")
+
+            elif key == ord("f"):
+                # F = toggle fullscreen
+                fs = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN)
+                if fs == cv2.WINDOW_FULLSCREEN:
+                    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                else:
+                    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
             elapsed = time.time() - t0
             if elapsed < frame_delay:
@@ -1353,7 +1362,7 @@ if __name__ == "__main__":
     print("    N = следваща тема    B = предишна тема")
     print("    M = визуално меню    R = разбъркай")
     print()
-    print("  УРОК РЕЖИМ: T     ИЗХОД: Q")
+    print("  УРОК РЕЖИМ: T     FULLSCREEN: F     ИЗХОД: Q")
     print("=" * 60)
     print()
 
