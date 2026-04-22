@@ -93,7 +93,7 @@ pip install opencv-python mediapipe pyautogui numpy pillow requests
 
 ## Стартиране
 
-python main.py  
+python mouse_control.py  
 
 ---
 
@@ -122,16 +122,6 @@ python main.py
 - Изисква камера
 - Най-добри резултати при добро осветление
 - PyAutoGUI fail-safe (горен ляв ъгъл спира програмата)
-
----
-
-## Бъдещи подобрения
-
-- Две ръце
-- AI разпознаване на жестове
-- Custom gestures
-- GUI настройки
-- Web dashboard
 
 ---
 
