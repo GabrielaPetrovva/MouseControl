@@ -9,6 +9,7 @@ import math
 import time
 import random
 import shutil
+import json
 import requests
 from PIL import Image, ImageDraw, ImageFont
 from collections import deque
@@ -274,6 +275,8 @@ class Config:
     click_cooldown: float = 0.4
     scroll_sens:    float = 400.0
     scroll_dead:    float = 0.008
+    double_click_window: float = 0.40   # макс. сек между два пинча за двоен клик
+    drag_hold_time: float = 0.55        # сек задържан пинч преди drag
 
 CFG = Config()
 
@@ -646,29 +649,71 @@ class PuzzlePiece:
                 abs(self.cur_y - self.target_y) < snap_dist)
 
 
+PUZZLE_DIFFICULTY = {          # (cols, rows)
+    'лесно':   (2, 2),
+    'нормално': (3, 3),
+    'трудно':  (4, 4),
+}
+DIFFICULTY_KEYS  = list(PUZZLE_DIFFICULTY.keys())
+RECORDS_FILE     = 'puzzle_records.json'
+
+
+def load_records() -> dict:
+    try:
+        with open(RECORDS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_record(theme_label: str, difficulty: str, seconds: int) -> bool:
+    """Записва рекорд. Връща True ако е нов рекорд."""
+    records = load_records()
+    key = f"{theme_label}_{difficulty}"
+    prev = records.get(key, None)
+    if prev is None or seconds < prev:
+        records[key] = seconds
+        try:
+            with open(RECORDS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(records, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        return True
+    return False
+
+
 class PuzzleGame:
-    COLS      = 3
-    ROWS      = 3
     SNAP_DIST = 32
 
-    def __init__(self, frame_w: int, frame_h: int, theme_idx: int = 0):
-        self.fw        = frame_w
-        self.fh        = frame_h
-        self.theme_idx = theme_idx
+    def __init__(self, frame_w: int, frame_h: int, theme_idx: int = 0,
+                 difficulty: str = 'нормално'):
+        self.fw         = frame_w
+        self.fh         = frame_h
+        self.theme_idx  = theme_idx
+        self.difficulty = difficulty
+        cols, rows      = PUZZLE_DIFFICULTY.get(difficulty, (3, 3))
+        self.COLS       = cols
+        self.ROWS       = rows
 
         self.board_x = frame_w // 2
         self.board_y = 0
         self.board_w = frame_w // 2
         self.board_h = frame_h
 
-        self.pieces:    List[PuzzlePiece] = []
-        self.held:      Optional[int]     = None
-        self.hold_off_x = 0
-        self.hold_off_y = 0
-        self.completed  = False
-        self.start_time = time.time()
-        self.end_time:  Optional[float] = None
-        self.snap_anim: dict = {}
+        self.pieces:       List[PuzzlePiece] = []
+        self.held:         Optional[int]     = None
+        self.hold_off_x    = 0
+        self.hold_off_y    = 0
+        self.completed     = False
+        self.start_time    = time.time()
+        self.end_time:     Optional[float] = None
+        self.snap_anim:    dict = {}
+        self.is_new_record = False
+        # Подсказка: piece_id -> time кога е активирана
+        self._hint_piece:  Optional[int]   = None
+        self._hint_start:  float           = 0.0
+        self._hint_hover_start: float      = 0.0
+        self._hint_hover_id:    Optional[int] = None
 
         self._build_puzzle()
 
@@ -755,6 +800,29 @@ class PuzzleGame:
             piece.cur_x = px - self.hold_off_x
             piece.cur_y = py - self.hold_off_y
 
+    def update_hint_hover(self, px: int, py: int) -> None:
+        """Следи курсора – 2 сек задържане над парче -> подсказка."""
+        if self.held is not None or self.completed:
+            self._hint_hover_id    = None
+            self._hint_hover_start = 0.0
+            return
+        hovered = None
+        for piece in reversed(self.pieces):
+            if not piece.placed and piece.contains(px, py):
+                hovered = piece.id
+                break
+        now = time.time()
+        if hovered == self._hint_hover_id and hovered is not None:
+            if now - self._hint_hover_start >= 2.0:
+                self._hint_piece = hovered
+                self._hint_start = now
+        else:
+            self._hint_hover_id    = hovered
+            self._hint_hover_start = now
+        # Изчезва след 1.5 сек
+        if self._hint_piece is not None and now - self._hint_start > 1.5:
+            self._hint_piece = None
+
     def release(self):
         if self.held is None:
             return
@@ -766,17 +834,28 @@ class PuzzleGame:
             self.snap_anim[piece.id] = time.time()
         self.held = None
         if all(p.placed for p in self.pieces):
-            self.completed = True
-            self.end_time  = time.time()
+            self.completed     = True
+            self.end_time      = time.time()
+            duration           = int(self.end_time - self.start_time)
+            theme              = IMAGE_THEMES[self.theme_idx % len(IMAGE_THEMES)]
+            self.is_new_record = save_record(theme.label, self.difficulty, duration)
 
-    def reset(self, theme_idx: Optional[int] = None):
+    def reset(self, theme_idx: Optional[int] = None, difficulty: Optional[str] = None):
         if theme_idx is not None:
-            self.theme_idx = theme_idx
-        self.completed  = False
-        self.end_time   = None
-        self.held       = None
-        self.snap_anim  = {}
-        self.start_time = time.time()
+            self.theme_idx  = theme_idx
+        if difficulty is not None:
+            self.difficulty = difficulty
+            c, r = PUZZLE_DIFFICULTY.get(self.difficulty, (3, 3))
+            self.COLS, self.ROWS = c, r
+        self.completed     = False
+        self.end_time      = None
+        self.held          = None
+        self.snap_anim     = {}
+        self.is_new_record = False
+        self._hint_piece   = None
+        self._hint_hover_start = 0.0
+        self._hint_hover_id    = None
+        self.start_time    = time.time()
         self._build_puzzle()
 
     def _draw_dashed_rect(self, frame, x1, y1, x2, y2, color, thickness, dash=8):
@@ -859,6 +938,27 @@ class PuzzleGame:
                 frame[dst_y1:dst_y2, dst_x1:dst_x2] = np.clip(
                     roi.astype(np.int32) + 30, 0, 255).astype(np.uint8)
 
+        # Подсказка – призрачна целева позиция
+        if self._hint_piece is not None:
+            hp = next((p for p in self.pieces if p.id == self._hint_piece), None)
+            if hp and not hp.placed:
+                ghost = hp.img.copy()
+                ghost = (ghost.astype(np.float32) * 0.35).astype(np.uint8)
+                tx1, ty1 = hp.target_x, hp.target_y
+                tx2, ty2 = tx1 + hp.w, ty1 + hp.h
+                dx1 = max(0, tx1); dy1 = max(0, ty1)
+                dx2 = min(w, tx2); dy2 = min(h, ty2)
+                sx1 = dx1 - tx1; sy1 = dy1 - ty1
+                sx2 = sx1 + (dx2 - dx1); sy2 = sy1 + (dy2 - dy1)
+                if dx2 > dx1 and dy2 > dy1:
+                    roi = frame[dy1:dy2, dx1:dx2]
+                    frame[dy1:dy2, dx1:dx2] = np.clip(
+                        roi.astype(np.int32) + ghost[sy1:sy2, sx1:sx2].astype(np.int32),
+                        0, 255).astype(np.uint8)
+                    cv2.rectangle(frame, (dx1, dy1), (dx2, dy2), (0, 255, 255), 2)
+                    put_text_unicode(frame, "Подсказка",
+                        (dx1 + 4, dy1 + 4), font_size=12, color=(0, 255, 255))
+
         # Разделителна линия
         cv2.line(frame, (self.board_x, 0), (self.board_x, h), (60, 100, 140), 2)
 
@@ -876,7 +976,7 @@ class PuzzleGame:
         put_text_unicode(frame,
             f"{theme.label}: {placed}/{total}",
             (panel_x + 8, 8), font_size=fs_md, color=(0, 200, 255))
-        put_text_unicode(frame, f"Време: {elapsed} сек",
+        put_text_unicode(frame, f"Време: {elapsed} сек  |  {self.difficulty}",
             (panel_x + 8, 30), font_size=fs_sm, color=(160, 200, 160))
 
         bar_x, bar_y = panel_x + 8, 56
@@ -895,6 +995,7 @@ class PuzzleGame:
         put_text_unicode(frame, "R = разбъркай",       (panel_x+8, hints_y+38), font_size=fs_sm, color=(140,140,160))
         put_text_unicode(frame, "M = меню с теми",     (panel_x+8, hints_y+54), font_size=fs_sm, color=(140,140,160))
         put_text_unicode(frame, "P = изход от пъзел",  (panel_x+8, hints_y+70), font_size=fs_sm, color=(140,140,160))
+        put_text_unicode(frame, "D = трудност",         (panel_x+8, hints_y+86), font_size=fs_sm, color=(140,140,160))
 
         # Курсор
         if cursor_xy:
@@ -921,18 +1022,26 @@ class PuzzleGame:
         scale = min(w / 640, h / 480)
         overlay = frame.copy()
         bx1, by1 = w//4 - 20, h//3 - 10
-        bx2, by2 = 3*w//4 + 20, 2*h//3 + 20
+        bx2, by2 = 3*w//4 + 20, 2*h//3 + 40
         draw_rounded_rect(overlay, bx1, by1, bx2, by2, (10, 50, 20), radius=16)
         cv2.addWeighted(overlay, 0.88, frame, 0.12, 0, frame)
         draw_rounded_rect(frame, bx1, by1, bx2, by2, (0, 200, 80), radius=16, thickness=3)
         put_text_unicode(frame, "БРАВО!",
             (bx1 + int(60*scale), by1 + 20), font_size=int(28*scale), color=(0, 255, 120))
         put_text_unicode(frame, f"Завършен за {duration} секунди",
-            (bx1 + int(30*scale), by1 + int(70*scale)), font_size=int(18*scale), color=(200, 240, 200))
-        put_text_unicode(frame, f"Тема: {theme.label}",
-            (bx1 + int(50*scale), by1 + int(100*scale)), font_size=int(15*scale), color=(160, 200, 160))
-        put_text_unicode(frame, "N = нова тема  |  R = пак",
-            (bx1 + int(40*scale), by1 + int(130*scale)), font_size=int(14*scale), color=(120, 160, 120))
+            (bx1 + int(30*scale), by1 + int(65*scale)), font_size=int(18*scale), color=(200, 240, 200))
+        put_text_unicode(frame, f"Тема: {theme.label}  |  Трудност: {self.difficulty}",
+            (bx1 + int(30*scale), by1 + int(95*scale)), font_size=int(14*scale), color=(160, 200, 160))
+        # Рекорд
+        key = f"{theme.label}_{self.difficulty}"
+        rec = load_records().get(key)
+        if rec:
+            rec_color = (0, 255, 200) if self.is_new_record else (140, 180, 140)
+            rec_text  = f"Рекорд: {rec} сек" + ("  <<< НОВ РЕКОРД!" if self.is_new_record else "")
+            put_text_unicode(frame, rec_text,
+                (bx1 + int(30*scale), by1 + int(120*scale)), font_size=int(13*scale), color=rec_color)
+        put_text_unicode(frame, "N = нова тема  |  R = пак  |  D = трудност",
+            (bx1 + int(20*scale), by1 + int(148*scale)), font_size=int(13*scale), color=(120, 160, 120))
 
 
 # ──────────────────────────────────────────────
@@ -959,16 +1068,20 @@ def load_image_contain_from_array(src: np.ndarray, target_w: int, target_h: int,
 # ──────────────────────────────────────────────
 
 GESTURE_LABEL = {
-    "move":        "Движение",
-    "click":       "Пинч клик",
-    "right_click": "Десен клик",
-    "scroll":      "Скрол",
-    "none":        "-",
+    "move":         "Движение",
+    "click":        "Пинч клик",
+    "double_click": "Двоен клик",
+    "drag":         "Задържане / Drag",
+    "right_click":  "Десен клик",
+    "scroll":       "Скрол",
+    "none":         "-",
 }
 GESTURE_COLOR = {
-    "move":        (0,255,80),
-    "click":       (0,120,255),
-    "right_click": (255,100,0),
+    "move":         (0,255,80),
+    "click":        (0,120,255),
+    "double_click": (0,200,255),
+    "drag":         (255,160,0),
+    "right_click":  (255,100,0),
     "scroll":      (255,220,0),
     "none":        (160,160,160),
 }
@@ -985,12 +1098,15 @@ def draw_hand(frame: np.ndarray, landmarks, w: int, h: int) -> None:
 
 
 def draw_overlay(frame: np.ndarray, gesture: str, fps: float,
-                 puzzle_mode: bool, tutorial_mode: bool) -> None:
+                 puzzle_mode: bool, tutorial_mode: bool,
+                 presentation_mode: bool = False,
+                 drawing_mode: bool = False) -> None:
     h, w = frame.shape[:2]
     scale = min(w / 640, h / 480)
-    fs_sm = max(10, int(12 * scale))
-    fs_md = max(12, int(15 * scale))
+    fs_sm = max(9,  int(11 * scale))
+    fs_md = max(11, int(13 * scale))
 
+    # Активна зона – само в нормален режим
     if not puzzle_mode and not tutorial_mode:
         ax0 = int(CFG.active_zone_x[0] * w)
         ax1 = int(CFG.active_zone_x[1] * w)
@@ -998,33 +1114,493 @@ def draw_overlay(frame: np.ndarray, gesture: str, fps: float,
         ay1 = int(CFG.active_zone_y[1] * h)
         cv2.rectangle(frame, (ax0, ay0), (ax1, ay1), (0, 200, 80), 1)
 
-    panel_w = min(320, w - 12)
-    draw_rounded_rect(frame, 6, 4, 6 + panel_w, 74, (15, 15, 35), radius=8)
-    color = GESTURE_COLOR.get(gesture, (160,160,160))
+    # ── Компактна лента горе-ляво (само 1 ред) ──
+    color = GESTURE_COLOR.get(gesture, (160, 160, 160))
 
     mode_str = ""
-    if puzzle_mode:   mode_str = "[ПЪЗЕЛ] "
-    if tutorial_mode: mode_str = "[УРОК] "
+    if puzzle_mode:        mode_str = "[ПЪЗЕЛ] "
+    elif tutorial_mode:    mode_str = "[УРОК] "
+    elif presentation_mode:mode_str = "[ПРЕЗЕНТАЦИЯ] "
+    elif drawing_mode:     mode_str = "[РИСУВАНЕ] "
 
-    put_text_unicode(frame, f"{mode_str}Жест: {GESTURE_LABEL.get(gesture,'?')}",
-                     (12, 8), font_size=fs_md, color=color)
-    put_text_unicode(frame, f"FPS: {fps:.1f}  |  T=Урок  P=Пъзел  Q=Изход",
-                     (12, 32), font_size=fs_sm, color=(160, 160, 160))
+    gesture_label = GESTURE_LABEL.get(gesture, '?')
+    hud_text = f"{mode_str}{gesture_label}  |  FPS:{fps:.0f}  |  H=Начало  S=Настр  Q=Изход"
+    bar_h = max(22, int(26 * scale))
+    # Полупрозрачна лента само зад текста – минимална ширина
+    text_w = min(len(hud_text) * int(7 * scale) + 16, w - 4)
+    overlay = frame.copy()
+    draw_rounded_rect(overlay, 4, 2, 4 + text_w, 2 + bar_h, (10, 10, 25), radius=6)
+    cv2.addWeighted(overlay, 0.70, frame, 0.30, 0, frame)
+    put_text_unicode(frame, hud_text, (10, 4), font_size=fs_md, color=color)
 
-    if not puzzle_mode and not tutorial_mode:
+    # ── Малка легенда горе-дясно – само когато не е в режим ──
+    if not puzzle_mode and not tutorial_mode and not presentation_mode and not drawing_mode:
         hints = [
-            ("Показалец",  "Движение"),
-            ("Пинч",       "Ляв клик"),
-            ("2 пръста",   "Скрол"),
-            ("3 пръста",   "Десен клик"),
-            ("T",          "Урок режим"),
-            ("P",          "Пъзел режим"),
+            "T=Урок  P=Пъзел",
+            "I=Презент  W=Рисув",
+            "Пинч=Клик  3пр=РКлик",
         ]
-        panel_x = w - min(230, w // 3)
-        draw_rounded_rect(frame, panel_x-4, 4, w-4, 4+len(hints)*22+8, (15,15,35), radius=8)
-        for i, (g, a) in enumerate(hints):
-            put_text_unicode(frame, f"{g}: {a}", (panel_x, 10+i*22),
-                             font_size=fs_sm, color=(150,180,150))
+        hx = w - min(185, w // 3)
+        panel_h2 = len(hints) * int(18 * scale) + 6
+        overlay2 = frame.copy()
+        draw_rounded_rect(overlay2, hx - 4, 2, w - 2, 2 + panel_h2, (10, 10, 25), radius=6)
+        cv2.addWeighted(overlay2, 0.65, frame, 0.35, 0, frame)
+        for i, hint in enumerate(hints):
+            put_text_unicode(frame, hint, (hx, 6 + i * int(18 * scale)),
+                             font_size=fs_sm, color=(130, 160, 130))
+
+
+# ──────────────────────────────────────────────
+# Режим Презентация
+# ──────────────────────────────────────────────
+
+class PresentationMode:
+    """Жестово управление на слайдове.
+    Пинч (click)         → Следващ слайд
+    3 пръста (right_click) → Предишен слайд
+    Свайп наляво/надясно → запасен fallback
+    """
+    GESTURE_COOLDOWN = 0.9   # сек между команди
+
+    def __init__(self):
+        self._last_cmd      = 0.0
+        self._prev_ix       = None
+        self._feedback_cmd  = None   # 'next' | 'prev'
+        self._feedback_t    = 0.0    # кога е стартирал feedback
+        self._feedback_dur  = 0.8    # сек показване на анимацията
+
+    def update(self, gesture: str, ix: float) -> Optional[str]:
+        """Детектира жест и връща 'next' | 'prev' | None."""
+        now = time.time()
+        if now - self._last_cmd < self.GESTURE_COOLDOWN:
+            # Само обновяваме prev_ix за свайп fallback
+            if gesture == "move":
+                self._prev_ix = ix
+            else:
+                self._prev_ix = None
+            return None
+
+        cmd = None
+
+        # Пинч → следващ
+        if gesture == "click":
+            cmd = "next"
+
+        # 3 пръста → предишен
+        elif gesture == "right_click":
+            cmd = "prev"
+
+        # Свайп fallback (само при "move")
+        elif gesture == "move":
+            if self._prev_ix is not None:
+                delta = ix - self._prev_ix
+                if delta > 0.14:
+                    cmd = "prev"
+                elif delta < -0.14:
+                    cmd = "next"
+            self._prev_ix = ix
+        else:
+            self._prev_ix = None
+
+        if cmd:
+            self._last_cmd     = now
+            self._feedback_cmd = cmd
+            self._feedback_t   = now
+            if cmd == "next":
+                pyautogui.press("right")
+            else:
+                pyautogui.press("left")
+
+        return cmd
+
+    def draw(self, frame: np.ndarray, last_cmd: Optional[str]) -> None:
+        h, w = frame.shape[:2]
+        scale = min(w / 640, h / 480)
+        fs_sm = max(10, int(12 * scale))
+        fs_md = max(13, int(16 * scale))
+
+        # Компактен панел – само 2 реда
+        panel_w = min(310, w - 12)
+        draw_rounded_rect(frame, 6, 30, 6 + panel_w, 68, (30, 15, 40), radius=8)
+        put_text_unicode(frame, "[ПРЕЗЕНТАЦИЯ]",
+            (12, 34), font_size=fs_md, color=(200, 100, 255))
+        put_text_unicode(frame, "Пинч=Следващ  3пръста=Предишен  Свайп=fallback",
+            (12, 54), font_size=fs_sm, color=(180, 150, 200))
+
+        # Визуална обратна връзка – голяма стрелка + цветен flash
+        now = time.time()
+        age = now - self._feedback_t
+        if self._feedback_cmd and age < self._feedback_dur:
+            alpha = max(0.0, 1.0 - age / self._feedback_dur)
+            is_next = self._feedback_cmd == "next"
+            arrow   = ">>" if is_next else "<<"
+            color   = (0, 180, 255) if is_next else (255, 140, 0)
+
+            # Flash overlay
+            overlay = frame.copy()
+            side_w  = w // 6
+            if is_next:
+                cv2.rectangle(overlay, (w - side_w, 0), (w, h), color, -1)
+            else:
+                cv2.rectangle(overlay, (0, 0), (side_w, h), color, -1)
+            cv2.addWeighted(overlay, alpha * 0.25, frame, 1 - alpha * 0.25, 0, frame)
+
+            # Голям текст в центъра
+            fs_big = max(32, int(52 * scale))
+            cx_off = -40 if is_next else 10
+            put_text_unicode(frame, arrow,
+                (w // 2 + cx_off, h // 2 - int(30 * scale)),
+                font_size=fs_big, color=color)
+            label = "СЛЕДВАЩ" if is_next else "ПРЕДИШЕН"
+            put_text_unicode(frame, label,
+                (w // 2 - int(45 * scale), h // 2 + int(30 * scale)),
+                font_size=max(14, int(18 * scale)), color=color)
+
+
+
+# ──────────────────────────────────────────────
+# Режим Рисуване
+# ──────────────────────────────────────────────
+
+DRAW_COLORS = [
+    (0,   255, 80),   # зелено
+    (0,   120, 255),  # синьо
+    (0,   220, 255),  # циан
+    (255, 80,  0),    # оранжево
+    (255, 255, 255),  # бяло
+    (255, 60,  200),  # розово
+    (255, 220, 0),    # жълто
+]
+DRAW_THICKNESS = [2, 4, 7, 12]
+
+
+class DrawingMode:
+    """Рисуване с показалеца; пинч = пауза; 2 пръста = смяна цвят."""
+    def __init__(self):
+        self.canvas:       Optional[np.ndarray] = None
+        self.color_idx    = 0
+        self.thick_idx    = 1
+        self._prev_pt:    Optional[Tuple[int,int]] = None
+        self._drawing     = False
+        self._last_color_change = 0.0
+
+    def _ensure_canvas(self, h: int, w: int):
+        if self.canvas is None or self.canvas.shape[:2] != (h, w):
+            self.canvas = np.zeros((h, w, 3), dtype=np.uint8)
+
+    def update(self, gesture: str, ix: float, iy: float,
+               frame_w: int, frame_h: int) -> None:
+        self._ensure_canvas(frame_h, frame_w)
+        px = int(ix * frame_w)
+        py = int(iy * frame_h)
+        now = time.time()
+
+        if gesture == "scroll" and now - self._last_color_change > 0.5:
+            self.color_idx = (self.color_idx + 1) % len(DRAW_COLORS)
+            self._last_color_change = now
+            self._prev_pt = None
+            return
+
+        if gesture == "move":
+            self._drawing = True
+            if self._prev_pt:
+                cv2.line(self.canvas, self._prev_pt, (px, py),
+                         DRAW_COLORS[self.color_idx],
+                         DRAW_THICKNESS[self.thick_idx])
+            self._prev_pt = (px, py)
+        else:
+            self._drawing = False
+            self._prev_pt = None
+
+    def clear(self):
+        if self.canvas is not None:
+            self.canvas[:] = 0
+
+    def change_thickness(self):
+        self.thick_idx = (self.thick_idx + 1) % len(DRAW_THICKNESS)
+
+    def draw(self, frame: np.ndarray) -> None:
+        h, w = frame.shape[:2]
+        self._ensure_canvas(h, w)
+        # Налага canvas върху frame
+        mask = self.canvas.any(axis=2)
+        frame[mask] = cv2.addWeighted(frame, 0.3, self.canvas, 0.7, 0)[mask]
+
+        # HUD – позициониран под главната лента
+        scale = min(w / 640, h / 480)
+        fs_sm = max(10, int(11 * scale))
+        fs_md = max(12, int(14 * scale))
+        panel_w = min(280, w - 12)
+        draw_rounded_rect(frame, 6, 34, 6 + panel_w, 120, (20, 30, 15), radius=8)
+        put_text_unicode(frame, "[РИСУВАНЕ]",
+            (12, 38), font_size=fs_md, color=(80, 255, 120))
+        color = DRAW_COLORS[self.color_idx]
+        put_text_unicode(frame, f"Цвят (2 пръста = смяна)",
+            (12, 60), font_size=fs_sm, color=color)
+        thick = DRAW_THICKNESS[self.thick_idx]
+        put_text_unicode(frame, f"Дебелина: {thick}px  (Z = смяна)",
+            (12, 78), font_size=fs_sm, color=(180, 200, 180))
+        put_text_unicode(frame, "C = изчисти  W = изход",
+            (12, 96), font_size=fs_sm, color=(140, 160, 140))
+        # Цветна точка
+        cv2.circle(frame, (int(panel_w - 20), 79), 10, color, -1)
+        cv2.circle(frame, (int(panel_w - 20), 79), 10, (255,255,255), 1)
+
+
+# ──────────────────────────────────────────────
+# Начална страница (Home Screen)
+# ──────────────────────────────────────────────
+
+HOME_MENU_ITEMS = [
+    # (клавиш, label, описание, цвят)
+    ("T", "Урок режим",       "Научи жестовете стъпка по стъпка",       (0,  200, 255)),
+    ("P", "Пъзел режим",      "Наредете картинки с жестове",             (80, 180, 255)),
+    ("I", "Презентация",      "Контролирайте слайдове с пинч/жест",      (200, 100, 255)),
+    ("W", "Рисуване",         "Рисувайте с пръст във въздуха",           (80,  255, 120)),
+    ("S", "Настройки",        "Чувствителност, скорост, плавност",       (255, 200, 60)),
+    ("F", "Fullscreen",       "Превключи цял екран",                     (160, 160, 220)),
+    ("Q", "Изход",            "Затвори програмата",                      (100, 100, 120)),
+]
+
+# Жестови иконки за home screen (рисуват се вдясно от реда)
+def _draw_home_gesture_icon(frame, cx, cy, key):
+    if key == "T":
+        # Книжка / урок
+        cv2.rectangle(frame, (cx-18, cy-16), (cx+18, cy+16), (0,180,220), 2)
+        for dy in (-6, 0, 6):
+            cv2.line(frame, (cx-12, cy+dy), (cx+12, cy+dy), (0,180,220), 1)
+    elif key == "P":
+        # Пъзел парче
+        pts = np.array([[cx-14,cy-10],[cx,cy-10],[cx,cy-18],[cx+8,cy-18],
+                        [cx+8,cy-10],[cx+14,cy-10],[cx+14,cy+10],[cx,cy+10],
+                        [cx,cy+18],[cx-8,cy+18],[cx-8,cy+10],[cx-14,cy+10]], np.int32)
+        cv2.polylines(frame, [pts], True, (80,160,255), 2)
+    elif key == "I":
+        # Слайд + стрелка
+        cv2.rectangle(frame, (cx-16, cy-10), (cx+16, cy+10), (180,80,255), 2)
+        cv2.arrowedLine(frame, (cx-10,cy), (cx+10,cy), (180,80,255), 2, tipLength=0.4)
+    elif key == "W":
+        # Вълниста линия (четка)
+        pts2 = [(cx-16+i*4, cy + int(8*math.sin(i*1.2))) for i in range(9)]
+        for i in range(len(pts2)-1):
+            cv2.line(frame, pts2[i], pts2[i+1], (60,230,100), 2)
+    elif key == "S":
+        # Зъбно колело (апроксимация)
+        cv2.circle(frame, (cx, cy), 12, (220,180,50), 2)
+        cv2.circle(frame, (cx, cy),  5, (220,180,50), -1)
+        for ang in range(0, 360, 45):
+            r = math.radians(ang)
+            x1 = int(cx + 12*math.cos(r)); y1 = int(cy + 12*math.sin(r))
+            x2 = int(cx + 17*math.cos(r)); y2 = int(cy + 17*math.sin(r))
+            cv2.line(frame, (x1,y1), (x2,y2), (220,180,50), 3)
+    elif key == "F":
+        # Четири ъгъла
+        for sx, sy in [(-1,-1),(-1,1),(1,-1),(1,1)]:
+            ox, oy = cx + sx*14, cy + sy*10
+            cv2.line(frame, (ox, oy), (ox-sx*8, oy),   (140,140,200), 2)
+            cv2.line(frame, (ox, oy), (ox, oy-sy*6),   (140,140,200), 2)
+    elif key == "Q":
+        # X
+        cv2.line(frame, (cx-12,cy-10),(cx+12,cy+10),(100,100,130),2)
+        cv2.line(frame, (cx+12,cy-10),(cx-12,cy+10),(100,100,130),2)
+
+
+class HomeScreen:
+    """Начална страница – показва всички режими с клавишни shortcuts."""
+
+    ANIM_SPEED = 2.5   # скорост на пулсиране
+
+    def __init__(self):
+        self.visible    = True   # при старт е видим
+        self._start_t   = time.time()
+        self._selected  = 0     # текущо избран ред (за жест-навигация)
+        self._hover_t   = [0.0] * len(HOME_MENU_ITEMS)  # hover timestamp за всеки ред
+
+    def toggle(self):
+        self.visible = not self.visible
+        if self.visible:
+            self._start_t = time.time()
+
+    def draw(self, frame: np.ndarray, fps: float) -> None:
+        if not self.visible:
+            return
+        h, w  = frame.shape[:2]
+        scale = min(w / 640, h / 480)
+
+        # Тъмен полупрозрачен фон над целия кадър
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, h), (8, 12, 28), -1)
+        cv2.addWeighted(overlay, 0.82, frame, 0.18, 0, frame)
+
+        now   = time.time()
+        pulse = 0.5 + 0.5 * math.sin((now - self._start_t) * self.ANIM_SPEED)
+
+        # ── Заглавие ──
+        title_fs = max(18, int(26 * scale))
+        sub_fs   = max(11, int(13 * scale))
+        item_fs  = max(12, int(15 * scale))
+        desc_fs  = max(10, int(11 * scale))
+        key_fs   = max(14, int(17 * scale))
+
+        title_color = (
+            int(0   + 40  * pulse),
+            int(180 + 40  * pulse),
+            int(220 + 35  * pulse),
+        )
+        put_text_unicode(frame, "Camera Mouse Control",
+            (w//2 - int(130*scale), int(18*scale)), font_size=title_fs, color=title_color)
+        put_text_unicode(frame, "Управление с жестове на ръката  |  MediaPipe",
+            (w//2 - int(145*scale), int(18*scale) + title_fs + 4),
+            font_size=sub_fs, color=(100, 120, 160))
+
+        # Малък разделител
+        sep_y = int(18*scale) + title_fs + sub_fs + 14
+        cv2.line(frame, (w//4, sep_y), (3*w//4, sep_y), (40, 60, 100), 1)
+
+        # ── Менюта ──
+        n      = len(HOME_MENU_ITEMS)
+        row_h  = max(44, int(52 * scale))
+        total_h= n * row_h
+        start_y= sep_y + 10
+        panel_w= min(580, w - 40)
+        panel_x= w//2 - panel_w//2
+
+        for i, (key, label, desc, color) in enumerate(HOME_MENU_ITEMS):
+            ry  = start_y + i * row_h
+            is_selected = (i == self._selected)
+
+            # Фон на реда
+            bg_alpha = 0.55 if is_selected else 0.30
+            row_color = (int(color[0]*0.25), int(color[1]*0.25), int(color[2]*0.25))
+            ov2 = frame.copy()
+            draw_rounded_rect(ov2, panel_x, ry, panel_x + panel_w, ry + row_h - 4,
+                              row_color, radius=10)
+            cv2.addWeighted(ov2, bg_alpha, frame, 1 - bg_alpha, 0, frame)
+
+            # Бордер за избрания ред
+            if is_selected:
+                pulse_col = tuple(min(255, int(c * (0.7 + 0.3*pulse))) for c in color)
+                draw_rounded_rect(frame, panel_x, ry, panel_x + panel_w, ry + row_h - 4,
+                                  pulse_col, radius=10, thickness=2)
+
+            # Клавиш бокс
+            kx = panel_x + 10
+            ky = ry + (row_h - 4)//2 - int(14*scale)
+            draw_rounded_rect(frame, kx, ky, kx + int(28*scale), ky + int(28*scale),
+                              (30, 40, 70), radius=6)
+            draw_rounded_rect(frame, kx, ky, kx + int(28*scale), ky + int(28*scale),
+                              color, radius=6, thickness=1)
+            put_text_unicode(frame, key,
+                (kx + int(7*scale), ky + int(5*scale)), font_size=key_fs, color=color)
+
+            # Label + описание
+            tx = kx + int(36*scale)
+            put_text_unicode(frame, label,
+                (tx, ry + int(8*scale)), font_size=item_fs, color=color)
+            put_text_unicode(frame, desc,
+                (tx, ry + int(8*scale) + item_fs + 2), font_size=desc_fs,
+                color=(140, 150, 170))
+
+            # Икона вдясно
+            icon_cx = panel_x + panel_w - int(32*scale)
+            icon_cy = ry + (row_h - 4)//2
+            _draw_home_gesture_icon(frame, icon_cx, icon_cy, key)
+
+        # ── Долна лента ──
+        foot_y = start_y + total_h + 8
+        put_text_unicode(frame,
+            "HOME  -  натиснете клавиш за да влезете в режим   |   ESC / H = затвори",
+            (panel_x, foot_y), font_size=desc_fs, color=(70, 80, 110))
+
+        # FPS малко горе-дясно
+        put_text_unicode(frame, f"FPS {fps:.0f}",
+            (w - int(60*scale), 6), font_size=desc_fs, color=(60, 70, 100))
+
+
+# ──────────────────────────────────────────────
+# Настройки (Settings) панел
+# ──────────────────────────────────────────────
+
+@dataclass
+class SettingItem:
+    label:  str
+    attr:   str        # атрибут в CFG
+    step:   float
+    min_v:  float
+    max_v:  float
+    fmt:    str = "{:.2f}"
+
+
+SETTINGS_ITEMS = [
+    SettingItem("Плавност (smooth)", "smooth_window", 1, 2, 20, "{:.0f}"),
+    SettingItem("Разст. клик",       "click_distance", 0.005, 0.02, 0.15),
+    SettingItem("Cooldown клик",     "click_cooldown",  0.05, 0.1, 1.5),
+    SettingItem("Чувств. скрол",     "scroll_sens",    20.0, 50.0, 1000.0, "{:.0f}"),
+    SettingItem("Drag задържане",    "drag_hold_time",  0.05, 0.2, 2.0),
+]
+
+
+class SettingsPanel:
+    def __init__(self):
+        self.selected = 0
+        self.visible  = False
+
+    def toggle(self):
+        self.visible = not self.visible
+
+    def move(self, delta: int):
+        self.selected = (self.selected + delta) % len(SETTINGS_ITEMS)
+
+    def adjust(self, delta: int):
+        item = SETTINGS_ITEMS[self.selected]
+        val  = getattr(CFG, item.attr)
+        val  = round(val + item.step * delta, 6)
+        val  = max(item.min_v, min(item.max_v, val))
+        setattr(CFG, item.attr, val)
+        # Специален случай – smooth_window трябва да е int
+        if item.attr == "smooth_window":
+            setattr(CFG, item.attr, int(val))
+
+    def draw(self, frame: np.ndarray) -> None:
+        if not self.visible:
+            return
+        h, w  = frame.shape[:2]
+        scale = min(w / 640, h / 480)
+        fs_sm = max(10, int(12 * scale))
+        fs_md = max(12, int(15 * scale))
+
+        panel_w = min(360, w - 20)
+        panel_h = 50 + len(SETTINGS_ITEMS) * 28 + 30
+        sx = w // 2 - panel_w // 2
+        sy = h // 2 - panel_h // 2
+
+        overlay = frame.copy()
+        draw_rounded_rect(overlay, sx, sy, sx + panel_w, sy + panel_h, (15, 20, 40), radius=12)
+        cv2.addWeighted(overlay, 0.90, frame, 0.10, 0, frame)
+        draw_rounded_rect(frame, sx, sy, sx + panel_w, sy + panel_h,
+                          (80, 100, 160), radius=12, thickness=2)
+
+        put_text_unicode(frame, "НАСТРОЙКИ  (S = затвори)",
+            (sx + 12, sy + 10), font_size=fs_md, color=(160, 200, 255))
+        put_text_unicode(frame, "Стрелки UP/DOWN = избор   LEFT/RIGHT = промяна",
+            (sx + 12, sy + 32), font_size=max(9, int(10 * scale)), color=(120, 140, 180))
+
+        for i, item in enumerate(SETTINGS_ITEMS):
+            y  = sy + 56 + i * 28
+            bg = (40, 50, 80) if i == self.selected else (20, 25, 45)
+            draw_rounded_rect(frame, sx + 6, y - 2, sx + panel_w - 6, y + 22, bg, radius=6)
+            val  = getattr(CFG, item.attr)
+            vstr = item.fmt.format(val)
+            col  = (0, 220, 255) if i == self.selected else (180, 190, 210)
+            put_text_unicode(frame, f"{item.label}: {vstr}",
+                (sx + 14, y + 2), font_size=fs_sm, color=col)
+            if i == self.selected:
+                put_text_unicode(frame, "< >",
+                    (sx + panel_w - 40, y + 2), font_size=fs_sm, color=(255, 200, 0))
+
+        put_text_unicode(frame, "ESC = затвори без промяна",
+            (sx + 12, sy + panel_h - 20), font_size=max(9, int(10 * scale)),
+            color=(100, 110, 130))
 
 
 # ──────────────────────────────────────────────
@@ -1048,6 +1624,10 @@ class CameraMouseController:
 
         self.pos_buffer      = deque(maxlen=CFG.smooth_window)
         self.last_click      = 0.0
+        self.last_click2     = 0.0   # предпоследен клик (за двоен клик)
+        self._drag_active    = False  # мишката е задържана
+        self._pinch_held     = False  # пинчът е задържан в момента
+        self._pinch_start_t  = 0.0   # кога е захванат пинчът
         self.scroll_ref_y:   Optional[float] = None
         self.scroll_accum:   float = 0.0
         self.latest_result:  Optional[HandLandmarkerResult] = None
@@ -1055,13 +1635,28 @@ class CameraMouseController:
         self._frame_count    = 0
         self._fps_timer      = time.time()
 
-        self.puzzle_mode    = False
-        self.tutorial_mode  = False
-        self.show_theme_menu= False
-        self.puzzle:        Optional[PuzzleGame]    = None
-        self.tutorial:      Optional[TutorialMode]  = None
-        self.selector:      Optional[ThemeSelector] = None
-        self.current_theme_idx = 0
+        self.puzzle_mode        = False
+        self.tutorial_mode      = False
+        self.presentation_mode  = False
+        self.drawing_mode       = False
+        self.show_theme_menu    = False
+        self.puzzle:            Optional[PuzzleGame]      = None
+        self.tutorial:          Optional[TutorialMode]    = None
+        self.selector:          Optional[ThemeSelector]   = None
+        self.presentation:      Optional[PresentationMode]= None
+        self.drawing:           Optional[DrawingMode]     = None
+        self.settings_panel:    SettingsPanel              = SettingsPanel()
+        self.current_theme_idx  = 0
+        self.puzzle_difficulty  = 'нормално'
+        self._pres_last_cmd:    Optional[str] = None
+        self._pres_last_t:      float = 0.0
+
+        # Модален прозорец за обучение
+        self._tut_prompt_mode:  Optional[str] = None  # 'tutorial'|'puzzle'|'presentation'|'drawing'
+        self._tut_prompt_active: bool = False
+
+        # Начална страница
+        self.home_screen: HomeScreen = HomeScreen()  # видим при старт
 
         self.PINCH_CONFIRM = 3
         self.pinch_raw_buf = deque(maxlen=self.PINCH_CONFIRM)
@@ -1098,10 +1693,55 @@ class CameraMouseController:
         pyautogui.moveTo(sx, sy)
 
     def do_click(self, button: str = "left") -> None:
+        """Единичен клик с cooldown. При бърз двоен пинч → double click."""
         now = time.time()
-        if now - self.last_click >= CFG.click_cooldown:
+        if now - self.last_click < CFG.click_cooldown:
+            return
+        # Проверка за двоен клик
+        if button == "left" and (now - self.last_click2) < CFG.double_click_window:
+            pyautogui.doubleClick()
+            self.last_click2 = 0.0  # нулираме за следващия цикъл
+        else:
             pyautogui.click(button=button)
-            self.last_click = now
+            self.last_click2 = self.last_click
+        self.last_click = now
+
+    def update_drag(self, pinch_now: bool, nx: float, ny: float) -> str:
+        """
+        Следи задържан пинч -> drag.
+        Връща: 'drag' | 'click' | 'none' (жеста за HUD).
+        """
+        now = time.time()
+        if pinch_now:
+            if not self._pinch_held:
+                # Нов пинч
+                self._pinch_held    = True
+                self._pinch_start_t = now
+            held_dur = now - self._pinch_start_t
+            if held_dur >= CFG.drag_hold_time:
+                # Задържан достатъчно дълго -> drag
+                if not self._drag_active:
+                    self._drag_active = True
+                    pyautogui.mouseDown(button='left')
+                sx, sy = map_to_screen(nx, ny)
+                sx, sy = self.smooth(sx, sy)
+                pyautogui.moveTo(sx, sy)
+                return 'drag'
+            else:
+                # Все още не е drag – само движи
+                self.do_move(nx, ny)
+                return 'click'  # ще стане клик при пускане
+        else:
+            if self._pinch_held:
+                # Пинчът е пуснат
+                if self._drag_active:
+                    pyautogui.mouseUp(button='left')
+                    self._drag_active = False
+                else:
+                    # Кратък пинч -> клик
+                    self.do_click('left')
+            self._pinch_held = False
+            return 'none'
 
     def do_scroll(self, ny: float) -> None:
         if self.scroll_ref_y is None:
@@ -1180,6 +1820,91 @@ class CameraMouseController:
         theme = IMAGE_THEMES[self.current_theme_idx]
         print(f"[Тема] {theme.label}")
 
+    def _draw_tutorial_prompt(self, frame: np.ndarray) -> None:
+        """Рисува модален прозорец 'Искаш ли обучение? (Y/N)'."""
+        if not self._tut_prompt_active:
+            return
+        h, w  = frame.shape[:2]
+        scale = min(w / 640, h / 480)
+        pw, ph = min(420, w - 40), 120
+        px = w // 2 - pw // 2
+        py = h // 2 - ph // 2
+
+        mode_labels = {
+            'tutorial':     'Урок',
+            'puzzle':       'Пъзел',
+            'presentation': 'Презентация',
+            'drawing':      'Рисуване',
+        }
+        label = mode_labels.get(self._tut_prompt_mode, 'Режим')
+
+        overlay = frame.copy()
+        draw_rounded_rect(overlay, px, py, px + pw, py + ph, (15, 30, 55), radius=14)
+        cv2.addWeighted(overlay, 0.92, frame, 0.08, 0, frame)
+        draw_rounded_rect(frame, px, py, px + pw, py + ph, (80, 130, 220), radius=14, thickness=2)
+
+        fs_md = max(13, int(16 * scale))
+        fs_sm = max(11, int(13 * scale))
+        put_text_unicode(frame, f"Режим: {label}",
+            (px + 16, py + 12), font_size=fs_md, color=(0, 200, 255))
+        put_text_unicode(frame, "Искаш ли да видиш обучението?",
+            (px + 16, py + 38), font_size=fs_sm, color=(220, 220, 220))
+        put_text_unicode(frame, "Y = Да, покажи урока",
+            (px + 16, py + 62), font_size=fs_sm, color=(0, 220, 100))
+        put_text_unicode(frame, "N = Не, влез директно в режима",
+            (px + 16, py + 82), font_size=fs_sm, color=(255, 160, 60))
+        put_text_unicode(frame, "ESC = Отказ",
+            (px + 16, py + 102), font_size=max(9, int(11 * scale)), color=(140, 140, 160))
+
+    def _handle_tutorial_prompt_key(self, key: int, key32: int, w: int, h: int) -> bool:
+        """Обработва клавиш докато модалът е активен. Връща True ако е 'изял' клавиша."""
+        if not self._tut_prompt_active:
+            return False
+        if key == ord('y') or key == ord('Y'):
+            self._tut_prompt_active = False
+            self.home_screen.visible = False
+            # Стартираме урока независимо от режима
+            self.tutorial_mode = True
+            self.tutorial = TutorialMode()
+            self.puzzle_mode = False; self.drawing_mode = False
+            self.presentation_mode = False; self.show_theme_menu = False
+            print(f"[Урок] Стартиран преди '{self._tut_prompt_mode}'")
+        elif key == ord('n') or key == ord('N'):
+            self._tut_prompt_active = False
+            self._enter_mode_direct(self._tut_prompt_mode, w, h)
+        elif key == 27:  # ESC
+            self._tut_prompt_active = False
+            print("[Режим] Отказано.")
+        return True
+
+    def _enter_mode_direct(self, mode: str, w: int, h: int) -> None:
+        """Влиза директно в режима без обучение."""
+        self.tutorial_mode = False; self.puzzle_mode = False
+        self.drawing_mode = False; self.presentation_mode = False
+        self.show_theme_menu = False
+        self.home_screen.visible = False
+        if mode == 'tutorial':
+            self.tutorial_mode = True
+            self.tutorial = TutorialMode()
+            print("[Режим] Урок")
+        elif mode == 'puzzle':
+            self.puzzle_mode = True
+            self._reset_pinch()
+            if self.puzzle is None:
+                self.puzzle = PuzzleGame(w, h, theme_idx=self.current_theme_idx)
+            elif self.puzzle.completed:
+                self.puzzle.reset(theme_idx=self.current_theme_idx)
+            print(f"[Режим] Пъзел - {IMAGE_THEMES[self.current_theme_idx].label}")
+        elif mode == 'presentation':
+            self.presentation_mode = True
+            self.presentation = PresentationMode()
+            print("[Режим] Презентация")
+        elif mode == 'drawing':
+            self.drawing_mode = True
+            if self.drawing is None:
+                self.drawing = DrawingMode()
+            print("[Режим] Рисуване")
+
     def run(self) -> None:
         cap = cv2.VideoCapture(CFG.camera_index)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CFG.cam_width)
@@ -1231,30 +1956,66 @@ class CameraMouseController:
                 elif self.puzzle_mode and self.puzzle and not self.show_theme_menu:
                     cursor_x, cursor_y, grabbing = self.handle_puzzle(landmarks, w, h)
                     cursor = (cursor_x, cursor_y)
+                    self.puzzle.update_hint_hover(cursor_x, cursor_y)
+                    self.reset_scroll()
+                elif self.presentation_mode and self.presentation:
+                    cmd = self.presentation.update(gesture, ix)
+                    if cmd:
+                        self._pres_last_cmd = cmd
+                        self._pres_last_t   = time.time()
+                    self.reset_scroll()
+                elif self.drawing_mode and self.drawing:
+                    self.drawing.update(gesture, ix, iy, w, h)
                     self.reset_scroll()
                 elif not self.puzzle_mode and not self.tutorial_mode:
                     if gesture == "move":
                         self.do_move(ix, iy); self.reset_scroll()
+                        # Пусни drag ако бе активен
+                        if self._drag_active:
+                            pyautogui.mouseUp(button='left')
+                            self._drag_active = False
+                        self._pinch_held = False
                     elif gesture == "click":
-                        self.do_move(ix, iy); self.do_click("left"); self.reset_scroll()
+                        # Drag / double-click логика
+                        drag_res = self.update_drag(True, ix, iy)
+                        gesture  = drag_res  # обновяваме за HUD
+                        self.reset_scroll()
                     elif gesture == "right_click":
                         self.do_move(ix, iy); self.do_click("right"); self.reset_scroll()
                     elif gesture == "scroll":
                         self.do_scroll(iy)
+                        if self._drag_active:
+                            pyautogui.mouseUp(button='left'); self._drag_active = False
+                        self._pinch_held = False
                     else:
+                        self.update_drag(False, ix, iy)  # пускане на drag при none
                         self.reset_scroll()
             else:
                 self.reset_scroll()
+                # Ръката изчезна – пусни drag ако е активен
+                if self._drag_active:
+                    pyautogui.mouseUp(button='left')
+                    self._drag_active = False
+                self._pinch_held = False
                 if self.puzzle_mode:
                     self._reset_pinch()
                     if self.pinch_prev and self.puzzle:
                         self.puzzle.release()
 
             # ── Рисуване ──
+            if self.drawing_mode and self.drawing:
+                self.drawing.draw(frame)
             if self.puzzle_mode and self.puzzle:
                 self.puzzle.draw(frame, cursor, grabbing)
 
-            draw_overlay(frame, gesture, self.fps, self.puzzle_mode, self.tutorial_mode)
+            draw_overlay(frame, gesture, self.fps, self.puzzle_mode, self.tutorial_mode,
+                         self.presentation_mode, self.drawing_mode)
+
+            if self.presentation_mode and self.presentation:
+                pres_cmd = self._pres_last_cmd if time.time() - self._pres_last_t < 0.6 else None
+                self.presentation.draw(frame, pres_cmd)
+
+            self.settings_panel.draw(frame)
 
             if self.tutorial_mode and self.tutorial:
                 self.tutorial.draw(frame, gesture,
@@ -1263,37 +2024,79 @@ class CameraMouseController:
             if self.show_theme_menu and self.selector:
                 self.selector.draw(frame, self.current_theme_idx)
 
+            # Модален прозорец за обучение (рисува се последен, отгоре)
+            self._draw_tutorial_prompt(frame)
+
+            # Начална страница – рисува се отгоре на всичко (когато е видима)
+            self.home_screen.draw(frame, self.fps)
+
             self.update_fps()
             cv2.imshow(WINDOW_NAME, frame)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
+            # waitKeyEx дава пълен код на специалните клавиши (стрелки) на Windows
+            key32 = cv2.waitKeyEx(1)
+            key   = key32 & 0xFF
+
+            # Началната страница поглъща клавишите (когато е видима)
+            if self.home_screen.visible:
+                if key == ord('q') or key == ord('Q'):
+                    break
+                elif key == 27 or key == ord('h') or key == ord('H'):
+                    self.home_screen.visible = False
+                elif key in [ord(k.lower()) for k, *_ in HOME_MENU_ITEMS if k not in ('Q',)]:
+                    # Препращаме клавиша към нормалната обработка след скриване на home
+                    self.home_screen.visible = False
+                    # fall-through към нормалните handler-и по-долу чрез повторна обработка
+                    if key == ord('t'):
+                        self._tut_prompt_mode = 'tutorial'; self._tut_prompt_active = True
+                    elif key == ord('p'):
+                        self._tut_prompt_mode = 'puzzle';   self._tut_prompt_active = True
+                    elif key == ord('i'):
+                        self._tut_prompt_mode = 'presentation'; self._tut_prompt_active = True
+                    elif key == ord('w'):
+                        self._tut_prompt_mode = 'drawing';  self._tut_prompt_active = True
+                    elif key == ord('s'):
+                        self.settings_panel.toggle()
+                    elif key == ord('f'):
+                        fs = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN)
+                        if fs == cv2.WINDOW_FULLSCREEN:
+                            cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                        else:
+                            cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                continue  # не обработваме другите handler-и
+
+            # Модалният прозорец за обучение поглъща клавиши
+            if self._tut_prompt_active:
+                self._handle_tutorial_prompt_key(key, key32, w, h)
+            elif key == ord("q"):
                 break
 
+            # H = покажи начална страница
+            elif key == ord("h"):
+                self.home_screen.toggle()
+                print("[Home] " + ("Отворена" if self.home_screen.visible else "Затворена"))
+
             elif key == ord("t"):
-                self.tutorial_mode  = not self.tutorial_mode
-                self.puzzle_mode    = False
-                self.show_theme_menu= False
-                if self.tutorial_mode:
-                    self.tutorial = TutorialMode()
-                    print("[Режим] Урок")
-                else:
+                if self._tut_prompt_active:
+                    pass
+                elif self.tutorial_mode:
+                    self.tutorial_mode = False
                     print("[Режим] Нормален")
+                else:
+                    self._tut_prompt_mode   = 'tutorial'
+                    self._tut_prompt_active = True
 
             elif key == ord("p"):
-                self.tutorial_mode  = False
-                self.show_theme_menu= False
-                self.puzzle_mode    = not self.puzzle_mode
-                self._reset_pinch()
-                if self.puzzle_mode:
-                    if self.puzzle is None:
-                        self.puzzle = PuzzleGame(w, h, theme_idx=self.current_theme_idx)
-                    elif self.puzzle.completed:
-                        self.puzzle.reset(theme_idx=self.current_theme_idx)
-                    theme = IMAGE_THEMES[self.current_theme_idx]
-                    print(f"[Режим] Пъзел - {theme.label}")
-                else:
+                if self._tut_prompt_active:
+                    pass
+                elif self.puzzle_mode:
+                    self.puzzle_mode = False
+                    self.show_theme_menu = False
+                    self._reset_pinch()
                     print("[Режим] Нормален")
+                else:
+                    self._tut_prompt_mode   = 'puzzle'
+                    self._tut_prompt_active = True
 
             elif key == ord("n") and self.puzzle_mode:
                 self._switch_theme(+1)
@@ -1323,6 +2126,68 @@ class CameraMouseController:
                 self.puzzle.reset()
                 self._reset_pinch()
                 print("[Пъзел] Разбъркан отново")
+
+            # D = смяна на трудност на пъзела
+            elif key == ord("d") and self.puzzle_mode:
+                idx = (DIFFICULTY_KEYS.index(self.puzzle_difficulty) + 1) % len(DIFFICULTY_KEYS)
+                self.puzzle_difficulty = DIFFICULTY_KEYS[idx]
+                if self.puzzle:
+                    self.puzzle.reset(difficulty=self.puzzle_difficulty)
+                    self._reset_pinch()
+                print(f"[Пъзел] Трудност: {self.puzzle_difficulty}")
+
+            # I = режим Презентация
+            elif key == ord("i"):
+                if self._tut_prompt_active:
+                    pass
+                elif self.presentation_mode:
+                    self.presentation_mode = False
+                    print("[Режим] Нормален")
+                else:
+                    self._tut_prompt_mode   = 'presentation'
+                    self._tut_prompt_active = True
+
+            # W = режим Рисуване
+            elif key == ord("w"):
+                if self._tut_prompt_active:
+                    pass
+                elif self.drawing_mode:
+                    self.drawing_mode = False
+                    print("[Режим] Нормален")
+                else:
+                    self._tut_prompt_mode   = 'drawing'
+                    self._tut_prompt_active = True
+
+            # C = изчисти canvas при рисуване
+            elif key == ord("c") and self.drawing_mode and self.drawing:
+                self.drawing.clear()
+                print("[Рисуване] Изчистено")
+
+            # Z = смяна дебелина при рисуване
+            elif key == ord("z") and self.drawing_mode and self.drawing:
+                self.drawing.change_thickness()
+                t = DRAW_THICKNESS[self.drawing.thick_idx]
+                print(f"[Рисуване] Дебелина: {t}px")
+
+            # S = настройки
+            elif key == ord("s"):
+                self.settings_panel.toggle()
+                print("[Настройки] " + ("Отворени" if self.settings_panel.visible else "Затворени"))
+
+            # Навигация в настройките
+            elif self.settings_panel.visible:
+                # cv2.waitKeyEx на Windows: стрелки = 2490368/2621440/2424832/2555904
+                # На Linux: 65362/65364/65361/65363 (горен байт)
+                if key32 in (82, 65362, 2490368):    # Up
+                    self.settings_panel.move(-1)
+                elif key32 in (84, 65364, 2621440):  # Down
+                    self.settings_panel.move(+1)
+                elif key32 in (81, 65361, 2424832):  # Left
+                    self.settings_panel.adjust(-1)
+                elif key32 in (83, 65363, 2555904):  # Right
+                    self.settings_panel.adjust(+1)
+                elif key == 27:  # ESC
+                    self.settings_panel.visible = False
 
             elif key == ord("f"):
                 # F = toggle fullscreen
@@ -1363,6 +2228,18 @@ if __name__ == "__main__":
     print("    M = визуално меню    R = разбъркай")
     print()
     print("  УРОК РЕЖИМ: T     FULLSCREEN: F     ИЗХОД: Q")
+    print()
+    print("  НОВИ РЕЖИМИ:")
+    print("    I = Презентация (свайп ляво/дясно = слайдове)")
+    print("    W = Рисуване (показалец рисува, 2 пръста = цвят, Z = дебелина, C = изчисти)")
+    print("    S = Настройки (стрелки за навигация и промяна)")
+    print()
+    print("  ЖЕСТ ПОДОБРЕНИЯ:")
+    print("    Двоен бърз пинч                 -> Двоен клик")
+    print("    Задържан пинч (>0.55 сек)        -> Drag & Drop")
+    print()
+    print("  ПЪЗЕЛ: D = трудност (2x2 / 3x3 / 4x4)  Рекорди в puzzle_records.json")
+    print("         Задръж курсор 2 сек над парче -> Подсказка")
     print("=" * 60)
     print()
 
